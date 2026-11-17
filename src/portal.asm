@@ -1,20 +1,17 @@
-; portal.asm - nether portals.
-;
-; An obsidian frame (any size from 2 x 3 to 21 x 21 inside, corners not
-; needed) lit with flint and steel fills with portal. Standing in it for
-; 3 seconds (creative: 1) takes the player to the other dimension, to
-; x / 8, z / 8 in the nether (x 8 on the way back), next to a portal there
-; within 16 nodes, or to a new one built on an obsidian platform. Breaking
-; the frame (or anything next to the portal) takes the portal away.
-
 %include "common.inc"
 
 global portal_try, portal_break, portal_update, portal_t, portal_need, portal_link
+global portal_item, island_travel, home_travel
 
+extern sound_keep, sound_keep_at
 extern pos, dt, game_mode, riding, dimension, world_get, world_set
 extern block_flags, save_all, save_meta, dim_enter
+extern meta_get, meta_set, hud_message, look_h, target, vel, yaw, player_spawn
+extern spawn_pos, dragon_respawn, spawn_guard
 
 MAX_SIDE    equ 21                  ; largest inside of a frame
+PORTAL_MARK equ 0x5D                ; on a dragon portal frame's bottom blocks
+ARRIVE_Z    equ 34                  ; where the island is reached (x 0)
 FLOOD_MAX   equ 1024
 
 section .rodata
@@ -24,6 +21,9 @@ f_one:      dd 1.0
 f_need:     dd 3.0                  ; seconds in the portal (survival)
 f_needc:    dd 1.0                  ; creative
 f_15:       dd 1.5
+f_needg:    dd 0.5                  ; seconds in a green portal
+s_onlynether: db "A DRAGON PORTAL ONLY WORKS IN THE NETHER", 0
+s_lightit:  db "NOW LIGHT IT WITH FLINT AND STEEL", 0
 nb6:        db 1,0,0, -1,0,0, 0,1,0, 0,-1,0, 0,0,1, 0,0,-1
 ; where else to try building, nearest first (x, z)
 near_spots: db 3,0, -3,0, 0,3, 0,-3, 3,3, -3,3, 3,-3, -3,-3
@@ -65,7 +65,7 @@ section .text
 ; frame: fill the frame with portal. 1 if it did.
 ; locals: [0] y, [4] axis, [8] y0, [12] y1, [16] a0, [20] a1, [24] a, [28] yy
 portal_try:
-    ENTER_FN 32
+    ENTER_FN 48
     mov r12d, edi
     mov [rsp], esi
     mov r13d, edx
@@ -218,6 +218,19 @@ portal_try:
     inc eax
     cmp [rsp + 28], eax
     jle .vy
+    ; built from a dragon portal (its bottom marked)? then green, to the
+    ; island
+    mov eax, [rsp + 8]
+    dec eax
+    mov [rsp + 28], eax
+    CELL [rsp + 16], [rsp + 28]
+    call meta_get
+    xor ecx, ecx
+    cmp eax, PORTAL_MARK
+    jne .plain
+    mov ecx, 1
+.plain:
+    mov [rsp + 32], ecx
     ; fill it
     mov eax, [rsp + 8]
     mov [rsp + 28], eax
@@ -227,6 +240,14 @@ portal_try:
 .fa:
     CELL [rsp + 24], [rsp + 28]
     mov ecx, B_PORTAL
+    cmp dword [rsp + 32], 0
+    je .put
+    mov ecx, [rsp + 4]              ; the green one: across x or z
+    shl ecx, 1
+    or ecx, 0x80
+    call meta_set                   ; (keeps edi, esi, edx)
+    mov ecx, W_SHAPE
+.put:
     call world_set
     inc dword [rsp + 24]
     mov eax, [rsp + 20]
@@ -292,7 +313,17 @@ portal_break:
     mov edx, r15d
     call world_get
     cmp eax, B_PORTAL
+    je .goes
+    cmp eax, W_SHAPE
     jne .pop
+    mov edi, r13d
+    mov esi, r14d
+    mov edx, r15d
+    call meta_get
+    and eax, 0x81
+    cmp eax, 0x80                   ; a green portal (not the way home)
+    jne .pop
+.goes:
     mov edi, r13d
     mov esi, r14d
     mov edx, r15d
@@ -327,8 +358,9 @@ portal_break:
 %endmacro
 
 ; void portal_update(void) - standing in a portal long enough travels
+; locals: [0] green portal's kind (-1 a nether portal)
 portal_update:
-    ENTER_FN 0
+    ENTER_FN 16
     mov eax, [f_need]
     cmp dword [game_mode], 0
     je .n
@@ -338,26 +370,165 @@ portal_update:
     cmp dword [riding], 0
     jne .outside
     movss xmm0, [pos]
-    FLOORF edi, xmm0
+    FLOORF r12d, xmm0
     movss xmm0, [pos + 4]
     addss xmm0, [f_half]
-    FLOORF esi, xmm0
+    FLOORF r13d, xmm0
     movss xmm0, [pos + 8]
-    FLOORF edx, xmm0
+    FLOORF r14d, xmm0
+    mov edi, r12d
+    mov esi, r13d
+    mov edx, r14d
     call world_get
+    mov dword [rsp], -1
     cmp eax, B_PORTAL
+    je .in
+    cmp eax, W_SHAPE
     jne .outside
+    mov edi, r12d
+    mov esi, r13d
+    mov edx, r14d
+    call meta_get
+    test eax, 0x80
+    jz .outside
+    and eax, 1
+    mov [rsp], eax                  ; 0 to the island, 1 home
+    mov eax, [f_needg]
+    mov [portal_need], eax
+.in:
     movss xmm0, [portal_t]
     addss xmm0, [dt]
     movss [portal_t], xmm0
     comiss xmm0, [portal_need]
     jb .out
     mov dword [portal_t], 0
+    cmp dword [rsp], 0
+    jl .nether
+    je .island
+    call home_travel
+    jmp .out
+.island:
+    call island_travel
+    jmp .out
+.nether:
     call portal_travel
     jmp .out
 .outside:
     mov dword [portal_t], 0
 .out:
+    LEAVE_FN
+
+; void island_travel(void) - to the dragon's island, at its edge facing
+; the middle
+island_travel:
+    sub rsp, 8
+    call save_all
+    SFX S_WHOOSH, 110, 60
+    xor edi, edi
+    mov esi, ARRIVE_Z
+    mov edx, 2
+    call dim_enter
+    mov dword [pos], 0x3f000000                 ; 0.5
+    mov eax, END_TOP + 1
+    cvtsi2ss xmm0, eax
+    movss [pos + 4], xmm0
+    mov eax, ARRIVE_Z
+    cvtsi2ss xmm0, eax
+    addss xmm0, [f_half]
+    movss [pos + 8], xmm0
+    xor eax, eax
+    mov [vel], eax
+    mov [vel + 4], eax
+    mov [vel + 8], eax
+    mov [yaw], eax                  ; looking at the middle (-z)
+    mov dword [spawn_guard], 0x3fc00000 ; 1.5 s before anything can hurt
+    call save_meta
+    add rsp, 8
+    ret
+
+; void home_travel(void) - from the island to the overworld: the bed slept
+; in last, or the world's spawn
+home_travel:
+    sub rsp, 8
+    call save_all
+    SFX S_WHOOSH, 110, 60
+    mov edi, [spawn_pos]
+    mov esi, [spawn_pos + 8]
+    xor edx, edx
+    call dim_enter
+    call player_spawn
+    call save_meta
+    add rsp, 8
+    ret
+
+; int portal_item(void) - right click with a dragon portal: in the nether,
+; an obsidian frame (2 x 3 inside) stands up on the node in front of the
+; block clicked, across the view, its bottom marked so that it lights
+; green. 1 if it was built.
+; locals: [0] a, [4] yy, [8] y
+portal_item:
+    ENTER_FN 16
+    cmp dword [dimension], 1
+    je .nether
+    lea rdi, [s_onlynether]
+    call hud_message
+    xor eax, eax
+    LEAVE_FN
+.nether:
+    mov r12d, [target + 12]
+    mov ebx, [target + 16]
+    mov r13d, [target + 20]
+    call look_h
+    mov r14d, 1                     ; looking along z: across x
+    xor r15d, r15d
+    cmp eax, 2
+    jae .ax
+    xor r14d, r14d                  ; along x: across z
+    mov r15d, 1
+.ax:
+    mov dword [rsp], -1
+.fa:
+    mov dword [rsp + 4], -1
+.fy:
+    mov eax, [rsp + 4]
+    add eax, ebx
+    mov [rsp + 8], eax
+    CELL [rsp], [rsp + 8]
+    xor ecx, ecx
+    cmp dword [rsp], -1
+    je .obs
+    cmp dword [rsp], 2
+    je .obs
+    cmp dword [rsp + 4], -1
+    je .obs
+    cmp dword [rsp + 4], 3
+    jne .put
+.obs:
+    mov ecx, B_OBSIDIAN
+.put:
+    call world_set
+    inc dword [rsp + 4]
+    cmp dword [rsp + 4], 3
+    jle .fy
+    inc dword [rsp]
+    cmp dword [rsp], 2
+    jle .fa
+    ; the mark under the opening
+    lea eax, [rbx - 1]
+    mov [rsp + 8], eax
+    mov dword [rsp], 0
+.mark:
+    CELL [rsp], [rsp + 8]
+    mov ecx, PORTAL_MARK
+    call meta_set
+    inc dword [rsp]
+    cmp dword [rsp], 1
+    jle .mark
+    lea rdi, [s_lightit]
+    call hud_message
+    SFX S_TICK_STONE, 90, 70
+    call dragon_respawn             ; (a dead dragon is back)
+    mov eax, 1
     LEAVE_FN
 
 ; portal_travel - to the other dimension
@@ -409,6 +580,7 @@ portal_travel:
     mov esi, [rsp + 4]
     mov edx, [dimension]
     xor edx, 1
+    SFX S_WHOOSH, 110, 60
     call dim_enter                  ; empty world, chunks round the target
     ; a portal within 16 nodes (the nearest column, its lowest node)?
     mov dword [rsp + 8], 0x7fffffff

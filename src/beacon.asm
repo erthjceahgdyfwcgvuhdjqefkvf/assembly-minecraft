@@ -1,19 +1,11 @@
-; beacon.asm - beacons: a light beam for builds (no powers).
-;
-; A beacon on top of a full 3x3 layer of iron, gold or diamond blocks (any
-; mix; a bigger pyramid under that is fine) with nothing solid over it
-; sends a beam up into the sky. Stained glass over it tints the beam from
-; that height on: the first pane gives its colour, every pane after mixes
-; half of its colour in. The mesher notes every beacon it sees in a loaded
-; chunk; the list is checked again one beacon a frame, so building or
-; breaking round one shows up within a moment.
-
 %include "common.inc"
 
 global beacon_clear, beacon_update, beacon_draw, beacons, beacon_count
+global eff_time, beacon_hud, effect_icon, beacon_status, beacon_open, beacon_sel
 
 extern dt, world_get, block_flags, wool_rgb, cur_pcx, cur_pcz, pos
 extern mesh_beacons, mesh_beacon_n
+extern meta_get, game_mode, hp, player_dead, hud_rect, win_w, invui_open
 extern glPushMatrix, glPopMatrix, glTranslatef, glRotatef, glBegin, glEnd
 extern glVertex3f, glColor4f, glEnable, glDisable, glBlendFunc, glDepthMask
 
@@ -33,6 +25,7 @@ BC_Z        equ 8
 BC_ON       equ 12                  ; 1 = the beam shines
 BC_NSEG     equ 16
 BC_SEG      equ 20                  ; MAX_SEGS x (u32 start y, u8 r, g, b, 0)
+BC_LEVEL    equ 60                  ; layers of pyramid under it (0-4)
 BC_SIZE     equ 64
 BEAM_TOP    equ 320                 ; world y the beam is drawn up to
 BEAM_RANGE  equ 320                 ; not drawn further away than this
@@ -49,6 +42,46 @@ f_spin:     dd 40.0                 ; degrees a second
 f_360:      dd 360.0
 f_one:      dd 1.0
 f_piece:    dd 16.0
+f_zero:     dd 0.0
+f_reach2:   dd 225.0                ; 15 nodes, squared
+f_linger:   dd 3.0
+f_regen:    dd 2.0                  ; half hearts a second
+f_badge:    dd 30.0
+f_bscale:   dd 3.0
+f_badgea:   dd 4.0
+; effect pictures, 8 x 8: 0 clear, 1 main colour, 2 dark, 3 light, 4 brown
+fx_heart:
+    db 0,1,1,0,1,1,0,0
+    db 1,3,3,1,1,1,1,0
+    db 1,3,1,1,1,1,1,0
+    db 1,1,1,1,1,1,1,0
+    db 0,1,1,1,1,1,0,0
+    db 0,0,1,1,1,0,0,0
+    db 0,0,0,1,0,0,0,0
+    db 0,0,0,0,0,0,0,0
+fx_sword:
+    db 0,0,0,0,0,0,3,3
+    db 0,0,0,0,0,3,1,3
+    db 0,0,0,0,3,1,3,0
+    db 0,4,0,3,1,3,0,0
+    db 0,0,4,1,3,0,0,0
+    db 0,0,4,4,0,0,0,0
+    db 0,4,0,0,4,0,0,0
+    db 4,0,0,0,0,0,0,0
+fx_boots:
+    db 0,1,1,1,0,0,0,0
+    db 0,1,3,1,0,0,0,0
+    db 0,1,3,1,0,0,0,0
+    db 0,1,1,1,1,0,0,0
+    db 0,1,1,1,1,1,0,0
+    db 0,1,1,1,1,1,1,0
+    db 0,2,2,2,2,2,2,0
+    db 0,0,0,0,0,0,0,0
+; colours (0xAABBGGRR) of codes 1-4 for each: regeneration, strength, speed
+fx_cols:
+    dd 0xff2828e0, 0xff101090, 0xffa0a0ff, 0xff28506e
+    dd 0xffc8c8c8, 0xff707070, 0xffffffff, 0xff28506e
+    dd 0xfff0c050, 0xff905010, 0xfffff0b0, 0xff28506e
 
 section .bss
 alignb 16
@@ -59,6 +92,9 @@ spin:         resd 1
 b_y0:         resd 1                ; the column beam_box draws
 b_y1:         resd 1
 b_w:          resd 1
+eff_time:     resd 3                ; regeneration, strength, speed: seconds left
+regen_acc:    resd 1
+beacon_sel:   resd 3                ; the beacon whose screen is open
 
 section .text
 
@@ -95,12 +131,15 @@ beacon_add:
     mov [rax + BC_Z], edx
     mov dword [rax + BC_ON], 0
     mov dword [rax + BC_NSEG], 0
+    mov dword [rax + BC_LEVEL], 0
 .out:
     ret
 
-; void beacon_update(void) - take the mesher's notes, check one beacon
+; void beacon_update(void) - take the mesher's notes, check one beacon;
+; the effects of the beacons in reach
 beacon_update:
     ENTER_FN 0
+    call beacon_effects
 .notes:
     mov eax, [mesh_beacon_n]
     test eax, eax
@@ -161,6 +200,7 @@ beacon_check:
     cmp eax, B_BEACON
     jne .remove
     mov dword [rbx + BC_ON], 0
+    mov dword [rbx + BC_LEVEL], 0
     ; the 3x3 layer under it
     mov dword [rsp], -1
 .bx:
@@ -181,6 +221,36 @@ beacon_check:
     inc dword [rsp]
     cmp dword [rsp], 1
     jle .bx
+    ; how many layers: each the next size wider, one lower
+    mov dword [rbx + BC_LEVEL], 1
+    mov r12d, 2
+.layer:
+    mov r13d, r12d
+    neg r13d                        ; dx
+.lx:
+    mov r14d, r12d
+    neg r14d                        ; dz
+.lz:
+    mov edi, [rbx + BC_X]
+    add edi, r13d
+    mov esi, [rbx + BC_Y]
+    sub esi, r12d
+    mov edx, [rbx + BC_Z]
+    add edx, r14d
+    call world_get
+    IS_BASE
+    jne .layers
+    inc r14d
+    cmp r14d, r12d
+    jle .lz
+    inc r13d
+    cmp r13d, r12d
+    jle .lx
+    mov [rbx + BC_LEVEL], r12d
+    inc r12d
+    cmp r12d, 4
+    jle .layer
+.layers:
     ; up the column: white until the first stained glass
     mov dword [rbx + BC_NSEG], 1
     mov eax, [rbx + BC_Y]
@@ -260,6 +330,211 @@ beacon_check:
     mov ecx, BC_SIZE / 8
     rep movsq
     jmp .out
+
+; beacon_effects - the timers run down; each full beacon with the sky over
+; it and an effect picked gives it while the player is within 15 nodes;
+; regeneration heals in survival
+beacon_effects:
+    push rbx
+    push r12
+    sub rsp, 8
+    xor ecx, ecx
+.t:
+    lea rax, [eff_time]
+    movss xmm0, [rax + rcx*4]
+    subss xmm0, [dt]
+    maxss xmm0, [f_zero]
+    movss [rax + rcx*4], xmm0
+    inc ecx
+    cmp ecx, 3
+    jb .t
+    xor r12d, r12d
+.b:
+    cmp r12d, [beacon_count]
+    jae .regen
+    imul eax, r12d, BC_SIZE
+    lea rbx, [beacons]
+    add rbx, rax
+    cmp dword [rbx + BC_ON], 0
+    je .n
+    cmp dword [rbx + BC_LEVEL], 4
+    jb .n
+    cvtsi2ss xmm0, dword [rbx + BC_X]
+    addss xmm0, [f_half]
+    subss xmm0, [pos]
+    mulss xmm0, xmm0
+    cvtsi2ss xmm1, dword [rbx + BC_Z]
+    addss xmm1, [f_half]
+    subss xmm1, [pos + 8]
+    mulss xmm1, xmm1
+    addss xmm0, xmm1
+    comiss xmm0, [f_reach2]
+    ja .n
+    mov edi, [rbx + BC_X]
+    mov esi, [rbx + BC_Y]
+    mov edx, [rbx + BC_Z]
+    call meta_get
+    and eax, 3
+    jz .n
+    lea rcx, [eff_time]
+    mov edx, [f_linger]
+    mov [rcx + rax*4 - 4], edx
+.n:
+    inc r12d
+    jmp .b
+.regen:
+    movss xmm0, [eff_time]
+    comiss xmm0, [f_zero]
+    jbe .noregen
+    cmp dword [game_mode], 0
+    jne .noregen
+    cmp dword [player_dead], 0
+    jne .noregen
+    cmp dword [hp], 20
+    jge .noregen
+    movss xmm0, [dt]
+    mulss xmm0, [f_regen]
+    addss xmm0, [regen_acc]
+    movss [regen_acc], xmm0
+    comiss xmm0, [f_one]
+    jb .out
+    subss xmm0, [f_one]
+    movss [regen_acc], xmm0
+    inc dword [hp]
+    jmp .out
+.noregen:
+    mov dword [regen_acc], 0
+.out:
+    add rsp, 8
+    pop r12
+    pop rbx
+    ret
+
+; int beacon_status(x, y, z) - eax its layers (0-4), ecx 1 with the sky
+; over it; eax -1 when it is not known yet
+beacon_status:
+    lea rax, [beacons]
+    xor ecx, ecx
+.f:
+    cmp ecx, [beacon_count]
+    jae .no
+    cmp [rax + BC_X], edi
+    jne .n
+    cmp [rax + BC_Y], esi
+    jne .n
+    cmp [rax + BC_Z], edx
+    jne .n
+    mov ecx, [rax + BC_ON]
+    mov eax, [rax + BC_LEVEL]
+    ret
+.n:
+    add rax, BC_SIZE
+    inc ecx
+    jmp .f
+.no:
+    mov eax, -1
+    xor ecx, ecx
+    ret
+
+; void beacon_open(x, y, z) - right click on a beacon: its screen
+beacon_open:
+    sub rsp, 8
+    mov [beacon_sel], edi
+    mov [beacon_sel + 4], esi
+    mov [beacon_sel + 8], edx
+    call beacon_add                 ; (a new one is checked at once)
+    mov edi, GS_BEACON
+    call invui_open
+    add rsp, 8
+    ret
+
+; void effect_icon(int effect 1-3, float x, y, pixel size) - its picture
+; locals: [0] x, [4] y, [8] size, [16] picture, [24] colours, [32] i
+effect_icon:
+    ENTER_FN 48
+    movss [rsp], xmm0
+    movss [rsp + 4], xmm1
+    movss [rsp + 8], xmm2
+    dec edi
+    and edi, 3
+    cmp edi, 2
+    jbe .k
+    xor edi, edi
+.k:
+    lea rax, [fx_heart]
+    lea rcx, [rax + rdi*8]
+    shl edi, 3                      ; 64 bytes each
+    lea rax, [rax + rdi*8]
+    mov rbx, rax
+    lea rax, [fx_cols]
+    shl edi, 1                      ; 16 bytes of colours each
+    add rax, rdi
+    mov r12, rax
+    xor r13d, r13d
+.p:
+    movzx eax, byte [rbx + r13]
+    test eax, eax
+    jz .n
+    mov r14d, [r12 + rax*4 - 4]
+    mov eax, r13d
+    and eax, 7
+    cvtsi2ss xmm0, eax
+    mulss xmm0, [rsp + 8]
+    addss xmm0, [rsp]
+    mov eax, r13d
+    shr eax, 3
+    cvtsi2ss xmm1, eax
+    mulss xmm1, [rsp + 8]
+    addss xmm1, [rsp + 4]
+    movaps xmm2, xmm0
+    addss xmm2, [rsp + 8]
+    movaps xmm3, xmm1
+    addss xmm3, [rsp + 8]
+    mov edi, r14d
+    call hud_rect
+.n:
+    inc r13d
+    cmp r13d, 64
+    jb .p
+    LEAVE_FN
+
+; void beacon_hud(void) - the effects on the player, top right: a badge
+; each, the picture on it
+beacon_hud:
+    ENTER_FN 16
+    xor r12d, r12d                  ; effect
+    xor r13d, r13d                  ; badges drawn
+.e:
+    lea rax, [eff_time]
+    movss xmm0, [rax + r12*4]
+    comiss xmm0, [f_zero]
+    jbe .n
+    inc r13d
+    cvtsi2ss xmm0, dword [win_w]
+    cvtsi2ss xmm1, r13d
+    mulss xmm1, [f_badge]
+    subss xmm0, xmm1
+    subss xmm0, [f_badgea]
+    movss [rsp], xmm0
+    movss xmm1, [f_badgea]
+    movaps xmm2, xmm0
+    addss xmm2, [f_badge]
+    subss xmm2, [f_badgea]
+    movss xmm3, [f_badge]
+    mov edi, 0x90000000
+    call hud_rect
+    movss xmm0, [rsp]
+    addss xmm0, [f_badgea]
+    movss xmm1, [f_badgea]
+    addss xmm1, [f_badgea]
+    movss xmm2, [f_bscale]
+    lea edi, [r12 + 1]
+    call effect_icon
+.n:
+    inc r12d
+    cmp r12d, 3
+    jb .e
+    LEAVE_FN
 
 ; void beacon_draw(void) - the beams, in node units round the player's
 ; chunk (as the mobs): a bright core and a faint glow, turning slowly

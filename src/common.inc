@@ -1,9 +1,3 @@
-; common.inc - constants, struct layouts and macros shared by every VoxASM module.
-;
-; Target: baseline x86-64 (AMD K8 / Turion 64 X2 class). Only x87, SSE and SSE2
-; instructions are used - no SSSE3, SSE4, AVX, FMA, POPCNT, LZCNT or BMI.
-; Keep include/voxasm.h in sync with everything in here.
-
 %ifndef VOXASM_COMMON_INC
 %define VOXASM_COMMON_INC
 
@@ -54,7 +48,13 @@ CI_NWAT         equ 24
 CI_MINY         equ 28              ; lowest world y of surface/water faces
 CI_FACECNT      equ 32              ; 6 x u32: surface vertices per face direction
 CI_MODIFIED     equ 56              ; edited since loaded: save it
-CI_LIGHTDIRTY   equ 57              ; light needs recomputing before meshing
+CI_LIGHTDIRTY   equ 57              ; light needs recomputing before meshing:
+                                    ; the relight steps still to do (see RELIGHT_STEPS)
+; An edit relights its chunk and the eight round it in three steps, each
+; done for all of them before the next: 3 every chunk from its own light
+; alone (so none keeps light that is no longer made), then 2 and 1 with
+; what leaks in from its neighbours (twice: light can cross two borders).
+RELIGHT_STEPS   equ 3
 CI_SIZE         equ 64
 CI_SHIFT        equ 6
 
@@ -130,9 +130,48 @@ B_PORTAL        equ 106             ; nether portal (inside an obsidian frame)
 B_SLIME         equ 107             ; slime block (bouncy)
 B_SGLASS        equ 108             ; stained glass: 16 colours, as wool
 B_BEACON        equ 124
-NUM_BLOCKS      equ 125
+B_TORCH_WALL    equ 125             ; a torch on the side of a block (it leans
+                                    ; from whichever solid block is next to it)
+B_BLUE_ORE      equ 126             ; bluestone ore
+B_BLUEBLOCK     equ 127             ; block of bluestone: power on every side
+NUM_BLOCKS      equ 128
+; Bluestone parts are nodes too, but their ids (128 and up) only ever sit in
+; the world: each state of a part is an id, and the inventory holds the
+; part's item (I_DUST ..) instead. wire.asm runs them.
+W_FIRST         equ 128
+W_WIRE          equ 128             ; dust: + signal 0..15
+W_TORCH         equ 144             ; + 2*k + lit; k 0 standing, 1..4 on the
+                                    ; block toward +x, -x, +z, -z
+W_LEVER         equ 154             ; + 2*k + on (k as the torch)
+W_BUTTON        equ 164             ; + 2*d + pressed; on the block toward d
+W_PLATE         equ 172             ; pressure plate, + pressed
+W_REPEATER      equ 174             ; + 2*d + on; d the way it faces
+W_COMPARATOR    equ 182             ; + 2*d + lit
+W_LAMP          equ 190             ; + lit
+W_PISTON        equ 192             ; + 2*dir + out; dir +x -x +y -y +z -z
+W_SPISTON       equ 204             ; sticky piston, the same
+W_PHEAD         equ 216             ; piston head, + dir
+W_RAIL          equ 222             ; + shape: 0 along x, 1 along z, 2-5 up
+                                    ; toward +x -x +z -z, 6-9 corners
+W_PRAIL         equ 232             ; powered rail, + 2*shape (0-5) + on
+W_DOOR          equ 244             ; + 0 closed, 1 open: the lower half;
+                                    ; + 2, 3 the upper half. Wood or iron,
+                                    ; facing and hinge: wire.asm keeps them
+W_TRAP          equ 248             ; trapdoor, + open
+W_END           equ 250             ; (end of the bluestone parts)
+W_BIRCHLOG      equ 250             ; birch and dark oak: log, log, planks,
+W_DARKLOG       equ 251             ; planks (their items are I_BIRCHLOG ..,
+W_BIRCHPLANKS   equ 252             ; 20 ids lower)
+W_DARKPLANKS    equ 253
+W_SHAPE         equ 254             ; a slab, stairs or a chest: what it is,
+                                    ; its material and way are kept by
+                                    ; position (wire.asm, meta)
+ITEM_TO_W       equ W_BIRCHLOG - I_BIRCHLOG
 NETHER_SEA      equ 32              ; nether lava sea: below this y index (y -32)
 NETHER_TOP      equ 127             ; nether bedrock roof (y index)
+END_TOP         equ 60              ; the dragon's island: its top (world y)
+END_R           equ 48              ; and how far it reaches from (0, 0)
+END_PILLARS     equ 5               ; obsidian pillars with crystals on top
 
 ; items that are not blocks (ids 128+; the inventory stores ids in a byte)
 I_FIRST         equ 128
@@ -181,7 +220,38 @@ I_EGG_GHAST     equ 209
 I_EGG_GIANT     equ 210
 I_RIFLE         equ 211             ; assault rifle (creative)
 I_SLIMEBALL     equ 212
-I_END           equ 213
+I_DUST          equ 213             ; bluestone dust .. minecart: the parts
+I_BTORCH        equ 214             ; wire.asm and cart.asm put in the world
+I_LEVER         equ 215
+I_BUTTON        equ 216
+I_PLATE         equ 217
+I_REPEATER      equ 218
+I_COMPARATOR    equ 219
+I_LAMP          equ 220
+I_PISTON        equ 221
+I_SPISTON       equ 222
+I_RAIL          equ 223
+I_PRAIL         equ 224
+I_CART          equ 225
+I_DOOR          equ 226             ; wooden door, iron door, trapdoor,
+I_IRONDOOR      equ 227             ; iron trapdoor (iron: odd)
+I_TRAPDOOR      equ 228
+I_IRONTRAP      equ 229
+I_BIRCHLOG      equ 230             ; placed as W_BIRCHLOG ..
+I_DARKLOG       equ 231
+I_BIRCHPLANKS   equ 232
+I_DARKPLANKS    equ 233
+I_OAKSTAIRS     equ 234             ; these and the rest are W_SHAPE
+I_BIRCHSTAIRS   equ 235
+I_DARKSTAIRS    equ 236
+I_STONESLAB     equ 237
+I_OAKSLAB       equ 238
+I_BIRCHSLAB     equ 239
+I_DARKSLAB      equ 240
+I_CHEST         equ 241
+I_BEACONCORE    equ 242             ; from wither skeletons: makes a beacon
+I_DRAGONPORTAL  equ 243             ; builds the frame of the portal to the island
+I_END           equ 244
 FLINT_USES      equ 64              ; flint and steel durability
 NUM_ICONS       equ I_END - I_FIRST
 B_UNKNOWN       equ 255             ; not loaded: solid + opaque
@@ -223,8 +293,8 @@ MESH_SURF_CAP   equ 6 * MESH_BIN_CAP
 MESH_DEEP_CAP   equ 131072
 MESH_WAT_CAP    equ 65536
 
-ATLAS_W         equ 2048            ; largest atlas: 16 x 8 tiles of 128x128
-ATLAS_H         equ 1024
+ATLAS_W         equ 2048            ; largest atlas: 16 x 16 tiles of 128x128
+ATLAS_H         equ 2048
 TILE_CRACK      equ 24              ; first of 5 digging crack stages
 ICONS_W         equ 256             ; item icons: 16 x 8 cells of 16x16
 ICONS_H         equ 128
@@ -242,6 +312,8 @@ GS_FURNACE      equ 8
 GS_DYE          equ 9               ; dye maker (last of the item screens)
 GS_WORLDS       equ 10              ; world list
 GS_CONTROLS     equ 11              ; key bindings
+GS_CHEST        equ 12              ; a chest (an item screen too)
+GS_BEACON       equ 13              ; a beacon: pick its effect
 
 ; ---------------------------------------------------------------- macros ---
 ; Function frame with all callee-saved GPRs pushed and %1 bytes of 16-byte
@@ -269,3 +341,37 @@ GS_CONTROLS     equ 11              ; key bindings
 %endmacro
 
 %endif
+
+; ---------------------------------------------------------------- sounds ---
+%include "sound_ids.inc"
+; recorded sounds (src/sounds, made by tools/prepsounds.py) after the made ones
+S_CAVE1         equ NUM_SOUNDS
+S_CAVE2         equ NUM_SOUNDS + 1
+S_CAVE3         equ NUM_SOUNDS + 2
+S_DRIP1         equ NUM_SOUNDS + 3  ; .. + 7: five single drops of water
+S_ROAR          equ NUM_SOUNDS + 8  ; the dragon's roar
+ALL_SOUNDS      equ NUM_SOUNDS + 9
+; a voice (sound.asm) playing a sound
+V_PTR           equ 0
+V_LEN           equ 8               ; samples
+V_ON            equ 12
+V_POS           equ 16              ; 16.16, 64-bit: sounds of any length
+V_STEP          equ 24              ; 16.16 samples a sample (the speed)
+V_VOL           equ 28              ; 256 = as made
+V_SIZE          equ 32
+
+; SFX id, loudness %, speed % - play a sound (sound.asm). Every register
+; and the flags are kept, so it can go anywhere; the module needs
+; "extern sound_keep".
+%macro SFX 3
+    push qword (%1) | ((%2) << 8) | ((%3) << 20)
+    call sound_keep
+    lea rsp, [rsp + 8]
+%endmacro
+; SFX_AT id, loudness %, speed % - the same for a sound at the place in
+; xmm0, xmm1, xmm2 (quieter with distance); needs "extern sound_keep_at"
+%macro SFX_AT 3
+    push qword (%1) | ((%2) << 8) | ((%3) << 20)
+    call sound_keep_at
+    lea rsp, [rsp + 8]
+%endmacro

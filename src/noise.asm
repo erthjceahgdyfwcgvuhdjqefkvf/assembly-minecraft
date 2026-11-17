@@ -1,12 +1,3 @@
-; noise.asm - Luanti's value noise (src/noise.cpp) ported to x86-64.
-;
-; Same lattice hash, smoothstep easing, bilinear/trilinear interpolation and
-; fractal octave sum as NoiseFractal2D / NoiseFractal3D, so the same seed
-; gives the same terrain shapes as Luanti's v7 mapgen.
-;
-; Internal contract (relied on by noise_fractal*): noise2d_value and
-; noise3d_value clobber only rax, rcx, rdx, r8-r11 and xmm0-xmm7.
-
 %include "common.inc"
 
 global noise2d, noise3d, noise2d_value, noise3d_value

@@ -1,15 +1,3 @@
-; worker.asm - world generation on a second CPU core.
-;
-; A raw clone() thread (no libc, no pthreads, so no glibc version
-; requirements) runs two kinds of job:
-;   chunk   - load it from the world's save folder or generate it, then
-;             light it (light_chunk)
-;   horizon - make the heights and colours of one far terrain tile
-; The main thread queues jobs and collects finished ones once per frame.
-; x86 stores are ordered, so writing a job's fields before its state (and
-; the data before JOB_DONE) is enough; the worker sleeps on a futex when
-; idle.
-
 %include "common.inc"
 
 global worker_start, worker_submit, worker_collect, worker_active

@@ -1,27 +1,17 @@
-; render.asm - OpenGL rendering: world, clouds, overlays and HUD.
-;
-; Three interchangeable ways to feed chunk geometry to the driver (the
-; RENDERER setting), so each can be measured on old hardware:
-;   0  VBO            (OpenGL 1.5) geometry in buffer objects
-;   1  display lists  (OpenGL 1.0) geometry compiled into lists
-;   2  vertex arrays  (OpenGL 1.1) geometry drawn from system memory
-; Everything is fixed-function: no shaders. Lighting uses three texture
-; units as a combiner (OpenGL 1.3 texture_env_combine):
-;   unit 0: primary rgb (sky light) x constant (daylight)
-;   unit 1: + primary alpha (block light)
-;   unit 2: x atlas texture, alpha from the texture
-; so night falls by changing one constant, without rebuilding meshes.
-
 %include "common.inc"
 
 global init_gl, rebuild_atlas, apply_vsync, renderer_reset, upload_slot
 global render_world, draw_hud, hud_begin, hud_rect, hud_text, hud_text_center, stat_count
 global hud_tile, stat_verts, vbo_ok, tex_atlas, tex_font, vis, hud_item
 global combine_ok, tint_begin, world_tex_begin, world_tex_end, client_pointers, unbind_vbo
+global item_shape, item_icon, f_tile_u, f_tile_v, f_rep_u, f_rep_v, upload_texture
+extern weather_draw, rain_level, beacon_hud, dragon_draw, dragon_hud
 global p_bindbuf, p_bufdata, p_genbuf, frustum_box, sky_rgb, draw_figure
 global fig_parts, fig_tint, name_t, hud_message, msg_t
 extern draw_mobs, draw_boats, draw_tnt, boom_t, item_name, dt
+extern eye_h
 extern dimension, portal_t, portal_need, draw_viewmodel, draw_fireballs, beacon_draw
+extern view_bob, fx_draw, block_flags
 %ifdef VOXASM_WIN
 extern glCopyTexSubImage2D, set_window
 %endif
@@ -33,6 +23,7 @@ extern errmsg, sunlight, tod
 ; player.asm
 extern pos, yaw, pitch, syaw, cyaw, eye_water, target_hit, target, dig_stage
 extern game_mode, hp, breath, sel_slot, hurt_flash
+extern chat_open, chat_len, chat_buf
 ; items.asm
 extern inv, tool_of, ents, ent_count
 ; horizon.asm
@@ -144,6 +135,8 @@ f_rad2deg:  dd 57.2957795
 f_deg2rad_half: dd 0.00872664626   ; pi / 360
 f_16:       dd 16.0
 f_8:        dd 8.0
+f_holeup:   dd 2.0                  ; fog where a chunk is missing: up to here
+f_128:      dd 128.0                ; above the eyes; a chunk in 1/8 nodes
 f_eighth:   dd 0.125
 f_fogs:     dd 0.6
 f_fogw1:    dd 20.0
@@ -154,11 +147,14 @@ f_outl1:    dd 1.005
 f_crk0:     dd -0.003
 f_crk1:     dd 1.003
 f_inv2048:  dd 0.00048828125
+f_rainsky:  dd 0.7                  ; rain: the sky this much toward grey,
+f_raingrey: dd 0.5                  ; this grey by day
+f_rainnight: dd 0.04
 f_inv1024:  dd 0.0009765625         ; atlas texels -> v (8 rows of 128)
 f_tile_u:   dd 0.0625               ; one atlas tile, normalised
-f_tile_v:   dd 0.125
+f_tile_v:   dd 0.0625
 f_rep_u:    dd 0.0078125            ; one repeat inside a tile
-f_rep_v:    dd 0.03125
+f_rep_v:    dd 0.0078125
 f_icon_u:   dd 0.0625               ; one item icon
 f_icon_v:   dd 0.125
 f_inv255:   dd 0.00392156863
@@ -188,6 +184,12 @@ f_name_t:   dd 2.0                  ; held item name shows this long
 f_name_y:   dd 118.0                ; this far above the bottom (over the hearts)
 f_msg_y:    dd 150.0                ; messages above that
 f_msg_t:    dd 3.0
+f_chat_h:   dd 24.0
+f_chat_x:   dd 6.0
+f_chat_ty:  dd 20.0
+s_chat_help: db "COMMANDS: SET DAY, SET NIGHT, SET RAIN, SET CLEAR,", 0
+s_chat_help2: db "SET CREATIVE, SET SURVIVAL", 0
+align 4
 f_count_h:  dd 12.0                 ; count text sits this far above the slot bottom
 f_hud4:     dd 4.0
 f_hud10:    dd 10.0
@@ -206,6 +208,7 @@ sky_col:    dd 0.62, 0.78, 1.0, 1.0
 water_col:  dd 0.10, 0.22, 0.45, 1.0
 lava_col:   dd 0.95, 0.35, 0.05, 1.0
 nether_col: dd 0.22, 0.04, 0.03, 1.0
+island_col: dd 0.05, 0.08, 0.06, 1.0
 f_nfog0:    dd 4.0                  ; nether haze: starts and ends (nodes)
 f_nfog1:    dd 56.0
 f_200:      dd 200.0
@@ -318,6 +321,7 @@ s_rs7:      db "RS7", 0
 s_rc4:      db "RC4", 0
 
 section .data
+align 4
 align 4
 name_t:     dd 0.0                  ; held item name: seconds left
 msg_t:      dd 0.0                  ; a message (hud_message): seconds left
@@ -693,7 +697,7 @@ setup_combiners:
     call glMatrixMode PLT
     call glLoadIdentity PLT
     movss xmm0, [f_inv2048]
-    movss xmm1, [f_inv1024]
+    movss xmm1, [f_inv2048]
     movss xmm2, [f_one]
     call glScalef PLT
     mov edi, GL_MODELVIEW
@@ -754,7 +758,7 @@ world_tex_begin:
     call glMatrixMode PLT
     call glLoadIdentity PLT
     movss xmm0, [f_inv2048]
-    movss xmm1, [f_inv1024]
+    movss xmm1, [f_inv2048]
     movss xmm2, [f_one]
     call glScalef PLT
     mov edi, GL_MODELVIEW
@@ -1119,7 +1123,7 @@ cull_chunks:
     subss xmm1, xmm0
     movss [rsp + 64], xmm1
     movss xmm1, [pos + 4]
-    addss xmm1, [f_eye]
+    addss xmm1, [eye_h]
     movss [rsp + 68], xmm1
     mov eax, [cur_pcz]
     shl eax, 4
@@ -1602,7 +1606,7 @@ draw_target:
     shl ecx, 7
     add eax, ecx
     cvtsi2ss xmm1, eax
-    mulss xmm1, [f_inv1024]
+    mulss xmm1, [f_inv2048]
     call glTexCoord2f PLT
     xor r14d, r14d
 .ca:
@@ -1678,6 +1682,8 @@ draw_target:
 sky_colour:
     cmp dword [dimension], 0
     je .ow
+    cmp dword [dimension], 2
+    je .island
     ; the nether: a dark red haze, nothing from daylight
     mov eax, 0x3f800000
     mov [env_col], eax
@@ -1729,11 +1735,36 @@ sky_colour:
     addss xmm2, [f_half]
     mulss xmm1, xmm2
 .st:
+    ; rain greys the sky
+    movss xmm3, [rain_level]
+    mulss xmm3, [f_rainsky]
+    movss xmm4, xmm0
+    mulss xmm4, [f_raingrey]
+    addss xmm4, [f_rainnight]
+    subss xmm4, xmm1
+    mulss xmm4, xmm3
+    addss xmm1, xmm4
     lea rax, [sky_rgb]
     movss [rax + rcx*4], xmm1
     inc ecx
     cmp ecx, 3
     jb .c
+    mov dword [sky_rgb + 12], 0x3f800000
+    ret
+
+.island:
+    ; the dragon's island: a dark green-black void, a steady dim light
+    movss xmm0, [sunlight]
+    movss [env_col], xmm0
+    movss [env_col + 4], xmm0
+    movss [env_col + 8], xmm0
+    mov dword [env_col + 12], 0x3f800000
+    mov eax, [island_col]
+    mov [sky_rgb], eax
+    mov eax, [island_col + 4]
+    mov [sky_rgb + 4], eax
+    mov eax, [island_col + 8]
+    mov [sky_rgb + 8], eax
     mov dword [sky_rgb + 12], 0x3f800000
     ret
 
@@ -1829,6 +1860,163 @@ draw_sky:
 .out:
     LEAVE_FN
 
+%macro IVERT 4                      ; u, v offsets, x sign, y sign
+    movss xmm0, [rsp + %1]
+    movss xmm1, [rsp + %2]
+    call glTexCoord2f PLT
+    movss xmm0, [f_ent_lift]
+%if %3 < 0
+    xorps xmm7, xmm7
+    subss xmm7, xmm0
+    movaps xmm0, xmm7
+%endif
+    movss xmm1, [f_ent_lift]
+%if %4 < 0
+    xorps xmm7, xmm7
+    subss xmm7, xmm1
+    movaps xmm1, xmm7
+%endif
+    xorps xmm2, xmm2
+    call glVertex3f PLT
+%endmacro
+
+; int item_icon(int item) - 0 for a block drawn as a cube, else the id
+; whose picture shows it (items; fences, gates and the dye maker have
+; pictures after the items')
+item_icon:
+    mov eax, I_END
+    cmp edi, B_FENCE
+    je .out
+    mov eax, I_END + 1
+    cmp edi, B_GATE_X
+    je .out
+    mov eax, I_END + 2
+    cmp edi, B_DYEMAKER
+    je .out
+    xor eax, eax
+    cmp edi, I_FIRST
+    jb .out
+    lea ecx, [rdi - I_BIRCHLOG]
+    cmp ecx, I_DARKPLANKS - I_BIRCHLOG
+    jbe .out                        ; birch and dark oak: their blocks
+    mov eax, edi
+.out:
+    ret
+
+; void item_shape(int item) - the item at the origin, as it lies on the
+; ground or is held: a block as a cube half a node across with its side
+; texture, anything else its picture standing in the x-y plane. Textures
+; on, the colour set by the caller.
+; locals: [4] u0, [8] v0, [12] u1, [16] v1
+item_shape:
+    ENTER_FN 32
+    mov r13d, edi
+    call item_icon
+    test eax, eax
+    jz .cube
+    mov r13d, eax
+    jmp .icon
+.cube:
+    cmp r13d, I_FIRST
+    jb .isblock
+    add r13d, ITEM_TO_W             ; a birch or dark oak log or planks
+.isblock:
+    mov edi, GL_TEXTURE_2D
+    mov esi, [tex_atlas]
+    call glBindTexture PLT
+    lea rax, [block_tiles]
+    movzx eax, byte [rax + r13*4 + 1]
+    mov ecx, eax
+    and ecx, 15
+    cvtsi2ss xmm0, ecx
+    mulss xmm0, [f_tile_u]
+    movss [rsp + 4], xmm0
+    addss xmm0, [f_rep_u]
+    movss [rsp + 12], xmm0
+    shr eax, 4
+    cvtsi2ss xmm0, eax
+    mulss xmm0, [f_tile_v]
+    movss [rsp + 8], xmm0
+    addss xmm0, [f_rep_v]
+    movss [rsp + 16], xmm0
+    mov edi, GL_QUADS
+    call glBegin PLT
+    ; a torch or a plant: its picture, flat (it is no cube)
+    lea rax, [block_flags]
+    test byte [rax + r13], F_CROSS
+    jz .box
+    movss xmm0, [f_rep_v]           ; (one repeat of its tile, not the cube's two)
+    mulss xmm0, [f_half]
+    addss xmm0, [rsp + 8]
+    movss [rsp + 16], xmm0
+    IVERT 4, 16, -1, -1
+    IVERT 12, 16, 1, -1
+    IVERT 12, 8, 1, 1
+    IVERT 4, 8, -1, 1
+    call glEnd PLT
+    jmp .out
+.box:
+    lea r14, [crack_quads]
+    xor r15d, r15d
+.cv:
+    movss xmm0, [rsp + 4]
+    cmp byte [r14 + 3], 0
+    je .cu
+    movss xmm0, [rsp + 12]
+.cu:
+    movss xmm1, [rsp + 8]
+    cmp byte [r14 + 4], 0
+    je .cvv
+    movss xmm1, [rsp + 16]
+.cvv:
+    call glTexCoord2f PLT
+%macro ECOORD 2                     ; byte offset, xmm register
+    movss %2, [f_ent_half]
+    cmp byte [r14 + %1], 0
+    jne %%p
+    xorps xmm7, xmm7
+    subss xmm7, %2
+    movaps %2, xmm7
+%%p:
+%endmacro
+    ECOORD 0, xmm0
+    ECOORD 1, xmm1
+    ECOORD 2, xmm2
+    call glVertex3f PLT
+    add r14, 5
+    inc r15d
+    cmp r15d, 24
+    jb .cv
+    call glEnd PLT
+    jmp .out
+.icon:
+    mov edi, GL_TEXTURE_2D
+    mov esi, [tex_icons]
+    call glBindTexture PLT
+    lea eax, [r13 - I_FIRST]
+    mov ecx, eax
+    and ecx, 15
+    cvtsi2ss xmm0, ecx
+    mulss xmm0, [f_icon_u]
+    movss [rsp + 4], xmm0
+    addss xmm0, [f_icon_u]
+    movss [rsp + 12], xmm0
+    shr eax, 4
+    cvtsi2ss xmm0, eax
+    mulss xmm0, [f_icon_v]
+    movss [rsp + 8], xmm0
+    addss xmm0, [f_icon_v]
+    movss [rsp + 16], xmm0
+    mov edi, GL_QUADS
+    call glBegin PLT
+    IVERT 4, 16, -1, -1
+    IVERT 12, 16, 1, -1
+    IVERT 12, 8, 1, 1
+    IVERT 4, 8, -1, 1
+    call glEnd PLT
+.out:
+    LEAVE_FN
+
 ; draw_entities - dropped items, in node units relative to the player chunk
 ; locals: [0] size, [4] u0, [8] v0, [12] u1, [16] v1, [20] brightness,
 ;         [24] corner
@@ -1870,6 +2058,10 @@ draw_entities:
     cvtsi2ss xmm1, ecx
     maxss xmm0, xmm1
     mulss xmm0, [f_inv255]
+    cmp byte [rbx + 24], I_BEACONCORE
+    jne .notcore
+    movss xmm0, [f_one]             ; a beacon core glows
+.notcore:
     movss [rsp + 20], xmm0
     movaps xmm1, xmm0
     movaps xmm2, xmm0
@@ -1890,86 +2082,20 @@ draw_entities:
     addss xmm1, [f_ent_lift]
     call glTranslatef PLT
     movzx r13d, byte [rbx + 24]     ; item
-    ; fences and gates show their picture (icons after the items)
-    cmp r13d, B_FENCE
-    jne .ngate
-    mov r13d, I_END
-    jmp .icon
-.ngate:
-    cmp r13d, B_GATE_X
-    jne .ndyem
-    mov r13d, I_END + 1
-    jmp .icon
-.ndyem:
-    cmp r13d, B_DYEMAKER
-    jne .nfence
-    mov r13d, I_END + 2
-    jmp .icon
-.nfence:
-    cmp r13d, I_FIRST
-    jae .icon
-    ; ---- block: a small spinning cube
+    mov edi, r13d
+    call item_icon
+    test eax, eax
+    jnz .icon
+    ; a block: a small spinning cube
     movss xmm0, [rbx + 28]
     mulss xmm0, [f_ent_spin]
     xorps xmm1, xmm1
     movss xmm2, [f_one]
     xorps xmm3, xmm3
     call glRotatef PLT
-    mov edi, GL_TEXTURE_2D
-    mov esi, [tex_atlas]
-    call glBindTexture PLT
-    lea rax, [block_tiles]
-    movzx eax, byte [rax + r13*4 + 1]
-    mov ecx, eax
-    and ecx, 15
-    cvtsi2ss xmm0, ecx
-    mulss xmm0, [f_tile_u]
-    movss [rsp + 4], xmm0
-    addss xmm0, [f_rep_u]
-    movss [rsp + 12], xmm0
-    shr eax, 4
-    cvtsi2ss xmm0, eax
-    mulss xmm0, [f_tile_v]
-    movss [rsp + 8], xmm0
-    addss xmm0, [f_rep_v]
-    movss [rsp + 16], xmm0
-    mov edi, GL_QUADS
-    call glBegin PLT
-    lea r14, [crack_quads]
-    xor r15d, r15d
-.cv:
-    movss xmm0, [rsp + 4]
-    cmp byte [r14 + 3], 0
-    je .cu
-    movss xmm0, [rsp + 12]
-.cu:
-    movss xmm1, [rsp + 8]
-    cmp byte [r14 + 4], 0
-    je .cvv
-    movss xmm1, [rsp + 16]
-.cvv:
-    call glTexCoord2f PLT
-%macro ECOORD 2                     ; byte offset, xmm register
-    movss %2, [f_ent_half]
-    cmp byte [r14 + %1], 0
-    jne %%p
-    xorps xmm7, xmm7
-    subss xmm7, %2
-    movaps %2, xmm7
-%%p:
-%endmacro
-    ECOORD 0, xmm0
-    ECOORD 1, xmm1
-    ECOORD 2, xmm2
-    call glVertex3f PLT
-    add r14, 5
-    inc r15d
-    cmp r15d, 24
-    jb .cv
-    call glEnd PLT
-    jmp .pop
+    jmp .shape
 .icon:
-    ; ---- item: a flat icon turned to face the camera
+    ; an item: a flat icon turned to face the camera
     movss xmm0, [yaw]
     mulss xmm0, [f_rad2deg]
     xorps xmm3, xmm3
@@ -1979,49 +2105,9 @@ draw_entities:
     movss xmm2, [f_one]
     xorps xmm3, xmm3
     call glRotatef PLT
-    mov edi, GL_TEXTURE_2D
-    mov esi, [tex_icons]
-    call glBindTexture PLT
-    lea eax, [r13 - I_FIRST]
-    mov ecx, eax
-    and ecx, 15
-    cvtsi2ss xmm0, ecx
-    mulss xmm0, [f_icon_u]
-    movss [rsp + 4], xmm0
-    addss xmm0, [f_icon_u]
-    movss [rsp + 12], xmm0
-    shr eax, 4
-    cvtsi2ss xmm0, eax
-    mulss xmm0, [f_icon_v]
-    movss [rsp + 8], xmm0
-    addss xmm0, [f_icon_v]
-    movss [rsp + 16], xmm0
-    mov edi, GL_QUADS
-    call glBegin PLT
-%macro IVERT 4                      ; u, v offsets, x sign, y sign
-    movss xmm0, [rsp + %1]
-    movss xmm1, [rsp + %2]
-    call glTexCoord2f PLT
-    movss xmm0, [f_ent_lift]
-%if %3 < 0
-    xorps xmm7, xmm7
-    subss xmm7, xmm0
-    movaps xmm0, xmm7
-%endif
-    movss xmm1, [f_ent_lift]
-%if %4 < 0
-    xorps xmm7, xmm7
-    subss xmm7, xmm1
-    movaps xmm1, xmm7
-%endif
-    xorps xmm2, xmm2
-    call glVertex3f PLT
-%endmacro
-    IVERT 4, 16, -1, -1
-    IVERT 12, 16, 1, -1
-    IVERT 12, 8, 1, 1
-    IVERT 4, 8, -1, 1
-    call glEnd PLT
+.shape:
+    mov edi, r13d
+    call item_shape
 .pop:
     call glPopMatrix PLT
     inc r12d
@@ -2036,6 +2122,117 @@ draw_entities:
     movss xmm2, [f_one]
     movss xmm3, [f_one]
     call glColor4f PLT
+.out:
+    LEAVE_FN
+
+; draw_holes - a chunk in reach that is not there yet (still being made,
+; or not meshed) is a block of fog, in the fog's colour, from the bottom
+; of the world to a little above the eyes, instead of a hole into the void.
+; In the chunk-scaled view (1/8 nodes round the player's chunk).
+; locals: [0] top, [4] bottom, [8] x0, [12] z0, [16] x1, [20] z1
+draw_holes:
+    ENTER_FN 32
+    movss xmm0, [pos + 4]
+    addss xmm0, [eye_h]
+    addss xmm0, [f_holeup]
+    mulss xmm0, [f_8]
+    movss [rsp], xmm0
+    mov eax, WORLD_YMIN * 8
+    cvtsi2ss xmm0, eax
+    movss [rsp + 4], xmm0
+    xor r15d, r15d                  ; begun drawing
+    xor ebx, ebx
+.c:
+    cmp ebx, [spiral_n]
+    jae .done
+    lea rax, [spiral]
+    mov r12d, [rax + rbx*8]
+    mov r13d, [rax + rbx*8 + 4]
+    mov edi, [cur_pcx]
+    add edi, r12d
+    mov esi, [cur_pcz]
+    add esi, r13d
+    call world_find
+    test eax, eax
+    js .hole
+    shl rax, CI_SHIFT
+    lea rcx, [chunk_info]
+    cmp byte [rcx + rax + CI_MESHED], 0
+    jne .next
+.hole:
+    test r15d, r15d
+    jnz .begun
+    mov r15d, 1
+    mov edi, GL_TEXTURE_2D
+    call glDisable PLT
+    mov edi, GL_ALPHA_TEST
+    call glDisable PLT
+    mov edi, GL_CULL_FACE
+    call glDisable PLT
+    movss xmm0, [sky_rgb]
+    movss xmm1, [sky_rgb + 4]
+    movss xmm2, [sky_rgb + 8]
+    movss xmm3, [f_one]
+    call glColor4f PLT
+    mov edi, GL_QUADS
+    call glBegin PLT
+.begun:
+    mov eax, r12d
+    shl eax, 7
+    cvtsi2ss xmm0, eax
+    movss [rsp + 8], xmm0
+    addss xmm0, [f_128]
+    movss [rsp + 16], xmm0
+    mov eax, r13d
+    shl eax, 7
+    cvtsi2ss xmm0, eax
+    movss [rsp + 12], xmm0
+    addss xmm0, [f_128]
+    movss [rsp + 20], xmm0
+%macro HV 3                         ; x, y, z locals
+    movss xmm0, [rsp + %1]
+    movss xmm1, [rsp + %2]
+    movss xmm2, [rsp + %3]
+    call glVertex3f PLT
+%endmacro
+    HV 8, 4, 12                     ; -z side
+    HV 16, 4, 12
+    HV 16, 0, 12
+    HV 8, 0, 12
+    HV 8, 4, 20                     ; +z side
+    HV 16, 4, 20
+    HV 16, 0, 20
+    HV 8, 0, 20
+    HV 8, 4, 12                     ; -x side
+    HV 8, 4, 20
+    HV 8, 0, 20
+    HV 8, 0, 12
+    HV 16, 4, 12                    ; +x side
+    HV 16, 4, 20
+    HV 16, 0, 20
+    HV 16, 0, 12
+    HV 8, 0, 12                     ; top
+    HV 16, 0, 12
+    HV 16, 0, 20
+    HV 8, 0, 20
+.next:
+    inc ebx
+    jmp .c
+.done:
+    test r15d, r15d
+    jz .out
+    call glEnd PLT
+    movss xmm0, [f_one]
+    movaps xmm1, xmm0
+    movaps xmm2, xmm0
+    movaps xmm3, xmm0
+    call glColor4f PLT
+    mov edi, GL_TEXTURE_2D
+    call glEnable PLT
+    mov edi, GL_ALPHA_TEST
+    call glEnable PLT
+    mov edi, GL_CULL_FACE
+    call glEnable PLT
 .out:
     LEAVE_FN
 
@@ -2099,6 +2296,9 @@ render_world:
     mov edi, GL_MODELVIEW
     call glMatrixMode PLT
     call glLoadIdentity PLT
+    call view_bob                   ; the steps move the view a little
+    xorps xmm2, xmm2
+    call glTranslatef PLT
     movss xmm0, [pitch]
     mulss xmm0, [f_rad2deg]
     movss xmm1, [f_one]
@@ -2119,7 +2319,7 @@ render_world:
     subss xmm1, xmm0
     movss [rsp], xmm1
     movss xmm1, [pos + 4]
-    addss xmm1, [f_eye]
+    addss xmm1, [eye_h]
     movss [rsp + 4], xmm1
     mov eax, [cur_pcz]
     shl eax, 4
@@ -2166,8 +2366,8 @@ render_world:
 .fog_hz:
     cmp dword [eye_water], 0
     jne .fog_eye
-    cmp dword [dimension], 0
-    je .fog
+    cmp dword [dimension], 1
+    jne .fog                        ; (the nether's fog is close)
     movss xmm1, [f_nfog0]
     movss xmm0, [f_nfog1]
     movss [rsp + 24], xmm0
@@ -2249,6 +2449,7 @@ render_world:
 .o_done:
     call unbind_vbo
     call world_tex_end
+    call draw_holes
 
     ; far terrain beyond the real chunks
     call horizon_draw
@@ -2327,12 +2528,15 @@ render_world:
     movss xmm2, [f_8]
     call glScalef PLT
     call draw_entities
+    call fx_draw
     call draw_mobs
     call draw_boats
+    call dragon_draw
     call draw_tnt
     call draw_fireballs
     call beacon_draw
     call draw_target
+    call weather_draw
     call glPopMatrix PLT
     mov eax, [stat_verts]
     mov [stat_count], eax
@@ -2679,8 +2883,15 @@ hud_item:
     mov eax, I_END + 2
     jmp .icon
 .nfence:
+    lea ecx, [rax - I_BIRCHLOG]
+    cmp ecx, I_DARKPLANKS - I_BIRCHLOG
+    ja .notwood
+    add eax, ITEM_TO_W
+    jmp .tile
+.notwood:
     cmp eax, I_FIRST
     jae .icon
+.tile:
     lea rcx, [block_tiles]
     movzx edi, byte [rcx + rax*4 + 1]
     call hud_tile
@@ -3198,6 +3409,57 @@ draw_hud:
     movss xmm1, [f_two]
     call hud_text_center
 .nomsg:
+    ; the command box: a dark bar along the bottom with what is typed
+    cmp dword [chat_open], 0
+    je .nochat
+    xorps xmm0, xmm0
+    cvtsi2ss xmm1, dword [win_h]
+    subss xmm1, [f_chat_h]
+    cvtsi2ss xmm2, dword [win_w]
+    cvtsi2ss xmm3, dword [win_h]
+    mov edi, 0xa0000000
+    call hud_rect
+    mov eax, [chat_len]
+    lea rdx, [chat_buf]
+    mov word [rdx + rax], '_'       ; the cursor (and the end of the text)
+    movss xmm0, [f_chat_x]
+    cvtsi2ss xmm1, dword [win_h]
+    subss xmm1, [f_chat_ty]
+    movss xmm2, [f_two]
+    mov rdi, rdx
+    mov esi, 0xffffffff
+    call hud_text
+    ; above it, the commands there are
+    xorps xmm0, xmm0
+    cvtsi2ss xmm1, dword [win_h]
+    subss xmm1, [f_chat_h]
+    subss xmm1, [f_chat_h]
+    subss xmm1, [f_chat_h]
+    cvtsi2ss xmm2, dword [win_w]
+    cvtsi2ss xmm3, dword [win_h]
+    subss xmm3, [f_chat_h]
+    mov edi, 0x70000000
+    call hud_rect
+    movss xmm0, [f_chat_x]
+    cvtsi2ss xmm1, dword [win_h]
+    subss xmm1, [f_chat_ty]
+    subss xmm1, [f_chat_h]
+    movss xmm2, [f_two]
+    lea rdi, [s_chat_help2]
+    mov esi, 0xff80e0ff             ; light yellow
+    call hud_text
+    movss xmm0, [f_chat_x]
+    cvtsi2ss xmm1, dword [win_h]
+    subss xmm1, [f_chat_ty]
+    subss xmm1, [f_chat_h]
+    subss xmm1, [f_chat_h]
+    movss xmm2, [f_two]
+    lea rdi, [s_chat_help]
+    mov esi, 0xff80e0ff
+    call hud_text
+.nochat:
+    call beacon_hud
+    call dragon_hud
     mov edi, GL_BLEND
     call glDisable PLT
     LEAVE_FN

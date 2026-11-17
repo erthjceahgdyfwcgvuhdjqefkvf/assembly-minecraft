@@ -1,19 +1,3 @@
-; liquid.asm - flowing water, following Luanti's liquid rules.
-;
-; Mapgen water is all sources and stays still until something changes next
-; to it. Every world_set queues the changed node and its six neighbours;
-; liquid_step re-evaluates queued nodes a few times per second:
-;   * water above, or a source beside it -> flowing level 7
-;   * flowing level L beside it, resting on something -> level L - 1
-;   * two or more sources beside it and solid/source below -> new source
-;   * nothing feeding it -> dries up
-; Sources spread sideways even when falling; flowing water only spreads
-; sideways once it rests on something, so it falls first and then fans out.
-;
-; Lava follows the same rules with 3 flowing levels (it runs 3 nodes from
-; a source), never makes new sources and moves only every 4th step. Lava
-; touching water hardens: a source to obsidian, flowing lava to cobblestone.
-
 %include "common.inc"
 
 global liquid_push, liquid_push_around, liquid_step, liquid_reset

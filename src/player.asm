@@ -1,21 +1,13 @@
-; player.asm - movement, collision, survival rules, digging and placing.
-;
-; Survival: digging takes the time items.asm works out from the block and
-; the tool in hand, drops what the block gives as an item on the ground,
-; wears the tool. Placing uses up the held stack. Health 20 with fall
-; damage and drowning (breath 10), slow regeneration, death drops the
-; inventory. Creative: instant digging, no drops, nothing used up, flying.
-; Right-clicking a crafting table or furnace opens it.
-
 %include "common.inc"
 
 global pos, vel, yaw, pitch, syaw, cyaw, on_ground, flying, eye_water
 global game_mode, hp, breath, sel_slot, target_hit, spawn_pos
-global target, dig_stage, player_dead, hurt_flash
+global target, dig_stage, player_dead, hurt_flash, spawn_guard
 global player_new, player_spawn, update_look, update_player, update_target
 global update_digging, update_survival, player_use, drop_selected, player_hurt
 global toggle_fly, select_slot, sprinting, wall_hit, knock_x, knock_z, spawn_bed
-global player_damage, throw_item, drop_block, pop_above
+global player_damage, throw_item, drop_block, pop_above, crouching, eye_h
+global body_water, body_lava, player_set_mode
 
 extern keys, dt, acc_x, acc_y, grabbed, lmb_down, warp_center, set_mouse
 extern world_get, world_set, world_raycast, block_flags
@@ -28,6 +20,9 @@ extern mob_attack, food_heal, mob_spawn, game_rand, mob_feed
 extern world_time, sunlight, mobs, mob_count, hud_message
 extern armor, armor_piece, armor_wear, riding, boat_use, boat_place, boat_attack
 extern bucket_use, flint_use, portal_break, dimension, rifle_fire
+extern sound_keep, sound_block, sound_step, hand_swing, fx_burst
+extern wire_click, wire_use_item, door_drop, dig_alias, node_boxes
+extern eff_time, beacon_open, portal_item, dragon_attack
 
 MODE_SURVIVAL   equ 0
 MOB_TYPE_OFF    equ 0               ; mobs.asm record: type, x at 4, z at 12
@@ -48,9 +43,7 @@ breath:     dd MAX_BREATH
 dig_stage:  dd -1
 sel_slot:   dd 0
 w_tap_t:    dd 9.0                  ; seconds since W was last pressed
-creative_bar:
-    db B_STONE, B_COBBLE, B_DIRT, B_PLANKS, B_LOG, B_GLASS, B_TORCH
-    db B_CRAFTTABLE, B_FURNACE
+eye_h:      dd 1.6                  ; the eyes above the feet (lower crouching)
 
 section .rodata
 align 16
@@ -73,6 +66,11 @@ f_jump:     dd 8.4
 f_swim:     dd 4.0
 f_wclimb:   dd 6.5
 f_walk:     dd 4.3
+f_speedfx:  dd 1.3                  ; a beacon's speed
+f_crouch:   dd 0.2                  ; crouching: a fifth of the walking speed
+f_ledge:    dd 0.6                  ; crouching: no stepping off a drop deeper
+f_eyecr:    dd 1.3                  ; eye height crouching
+f_eyerate:  dd 12.0
 f_sprint:   dd 6.5
 f_fly:      dd 12.0
 f_flyfast:  dd 30.0
@@ -90,6 +88,9 @@ s_morning:  db "GOOD MORNING - YOU WILL RESPAWN AT THIS BED", 0
 f_dtap:     dd 0.3                  ; seconds between W taps to sprint
 f_substep:  dd 0.4
 f_eps:      dd 0.0001
+f_step:     dd 0.55                 ; walking up onto a slab or stairs
+f_eighth:   dd 0.125
+f_big:      dd 1.0e9
 f_skin:     dd 0.001
 f_reach:    dd 5.0
 f_neg100:   dd -100.0
@@ -97,6 +98,11 @@ f_safefall: dd 13.0                 ; landing speed that starts to hurt
 f_falldmg:  dd 0.8                  ; damage per node/s above that
 f_bounce:   dd -0.8                 ; slime block: speed kept going back up
 f_bouncemin: dd -3.0                ; landing slower than this just stops
+f_landsnd:  dd -5.5                 ; landing this fast is heard
+f_landhard: dd -11.0                ; .. and this fast lands with a thump
+f_under:    dd 0.2
+wall_dirs:  db -1,0, 1,0, 0,-1, 0,1  ; x, z of the four blocks beside a node
+f_digsnd:   dd 0.24                 ; seconds between digging taps
 f_cdig:     dd 0.25                 ; creative dig repeat
 f_tbreath:  dd 1.0
 f_trefill:  dd 0.5
@@ -124,15 +130,18 @@ lava_t:     resd 1                  ; time in lava toward the next hurt
 burn_t:     resd 1                  ; on fire: seconds left
 wall_hit:   resd 1                  ; walked into a wall last frame
 sprinting:  resd 1                  ; W double-tapped, until W is let go
+crouching:  resd 1                  ; the sneak key held, on foot
 w_prev:     resd 1
 game_mode:  resd 1
 player_dead: resd 1
+spawn_guard: resd 1                 ; seconds no hit lands (just arrived on the island)
 hurt_flash: resd 1
 target_hit: resd 1
 target:     resd 6
 dig_pos:    resd 3
 dig_progress: resd 1
 dig_cool:   resd 1
+dig_snd:    resd 1                  ; until the next digging tap
 knock_x:    resd 1                  ; knockback (nodes/s), fading
 knock_z:    resd 1
 atk_cool:   resd 1                  ; until the next hit on a mob
@@ -141,6 +150,10 @@ t_breath:   resd 1
 t_regen:    resd 1
 spawn_pos:  resd 3                  ; where this world's player (re)spawns
 spawn_bed:  resd 1                  ; 1 = spawn_pos is a bed node (slept in)
+col_limit:  resd 1                  ; collide: where the box may go on the axis
+col_top:    resd 1                  ; the top of the highest box hit
+col_cell:   resd 3                  ; a node hit
+col_buf:    resb 16                 ; node_boxes' boxes
 
 section .text
 
@@ -154,26 +167,46 @@ section .text
 %%ok:
 %endmacro
 
+; int player_set_mode(int mode) - creative (1) or survival (0) from now on,
+; from a clean start: not flying, nothing half dug, still, full health and
+; breath, not on fire. 0 if it was that already.
+player_set_mode:
+    xor eax, eax
+    cmp edi, 1
+    ja .out                         ; nothing but 0 and 1
+    cmp edi, [game_mode]
+    je .out
+    mov [game_mode], edi
+    xor eax, eax
+    mov [flying], eax
+    mov [sprinting], eax
+    mov [crouching], eax
+    mov [vel], eax
+    mov [vel + 4], eax
+    mov [vel + 8], eax
+    mov [knock_x], eax
+    mov [knock_z], eax
+    mov [dig_progress], eax
+    mov [dig_cool], eax
+    mov [dig_snd], eax
+    mov [atk_hold], eax
+    mov [burn_t], eax
+    mov [lava_t], eax
+    mov [hurt_flash], eax
+    mov dword [dig_stage], -1
+    mov dword [hp], MAX_HP
+    mov dword [breath], MAX_BREATH
+    mov eax, 1
+.out:
+    ret
+
 ; void player_new(int mode) - fresh inventory for a new world
 player_new:
     sub rsp, 8
     mov [game_mode], edi
     mov dword [flying], 0
     mov dword [sel_slot], 0
-    call inv_clear
-    cmp dword [game_mode], MODE_CREATIVE
-    jne .out
-    xor ecx, ecx
-.s:
-    lea r8, [creative_bar]
-    movzx eax, byte [r8 + rcx]
-    or eax, 64 << 8
-    lea rdx, [inv]
-    mov [rdx + rcx*4], eax
-    inc ecx
-    cmp ecx, 9
-    jb .s
-.out:
+    call inv_clear                  ; both modes start with nothing
     add rsp, 8
     ret
 
@@ -245,6 +278,7 @@ player_hurt:
     test edi, edi
     jle .out
     sub [hp], edi
+    SFX S_HURT, 100, 100
     mov eax, [f_hurtflash]
     mov [hurt_flash], eax
     cmp dword [hp], 0
@@ -265,6 +299,9 @@ player_hurt:
 player_damage:
     cmp dword [game_mode], MODE_SURVIVAL
     jne .out
+    movss xmm0, [spawn_guard]       ; just arrived: nothing hurts yet
+    comiss xmm0, [f_zero]
+    ja .out
     test edi, edi
     jle .out
     sub rsp, 8
@@ -339,24 +376,27 @@ block_at:
     add rsp, 8
     ret
 
-; move_axis(edi axis, xmm0 delta)
-; Fences and closed gates are 1.5 nodes tall: the lower half of the node
-; above one is solid too, so nothing jumps over them.
-; locals: [0..23] min/max cell per axis (x0 x1 y0 y1 z0 z1), [32] delta,
-;         [40] 1 = hit the half node above a fence
-move_axis:
-    ENTER_FN 48
-    mov r12d, edi
-    movss [rsp + 32], xmm0
-    mov dword [rsp + 40], 0
-    lea rbx, [pos]
-    movss xmm1, [rbx + r12*4]
-    addss xmm1, xmm0
-    movss [rbx + r12*4], xmm1
+; collide(edi axis, esi sign: 1 moving +, -1 moving -, 0 only looking) -
+; the player's box at pos against the shapes of the nodes round it
+; (node_boxes): eax 1 if it is inside one; col_limit how far it may go on
+; the axis, col_top the top of the highest box, col_cell a node hit
+; locals: [0..23] cells (x0 x1 y0 y1 z0 z1), [24] cell x, y, z, [40] axis,
+;         [44] sign, [48] box min x y z, [60] box max, [72] box, [76] boxes
+collide:
+    ENTER_FN 80
+    mov [rsp + 40], edi
+    mov [rsp + 44], esi
+    mov dword [col_limit], 0x4e6e6b28   ; 1e9
+    test esi, esi
+    jns .lim
+    mov dword [col_limit], 0xce6e6b28   ; -1e9
+.lim:
+    mov dword [col_top], 0xce6e6b28
+    xor ebx, ebx                    ; (hit)
     xor ecx, ecx
-.box:
-    lea rbx, [pos]
-    movss xmm0, [rbx + rcx*4]
+.range:
+    lea rax, [pos]
+    movss xmm0, [rax + rcx*4]
     movaps xmm1, xmm0
     lea rax, [lo_off]
     addss xmm0, [rax + rcx*4]
@@ -369,52 +409,106 @@ move_axis:
     mov [rsp + rcx*8 + 4], eax
     inc ecx
     cmp ecx, 3
-    jb .box
+    jb .range
+    dec dword [rsp + 8]             ; a fence below reaches up
     mov r13d, [rsp + 8]
 .ly:
     mov r14d, [rsp + 16]
 .lz:
     mov r15d, [rsp]
 .lx:
+    mov [rsp + 24], r15d
+    mov [rsp + 28], r13d
+    mov [rsp + 32], r14d
     mov edi, r15d
     mov esi, r13d
     mov edx, r14d
-    call world_get
-    lea rcx, [block_flags]
-    test byte [rcx + rax], F_SOLID
-    jnz .hit
-    ; a bed: its lower half is solid
-    test byte [rcx + rax], F_HALF
-    jz .nohalf
-    cmp r12d, 1
-    jne .half
-    movss xmm0, [rsp + 32]
-    comiss xmm0, [f_zero]
-    jbe .half
-    jmp .nx                         ; rising from below: not possible
-.nohalf:
-    ; above a fence or closed gate, solid up to half a node
-    mov edi, r15d
-    lea esi, [r13 - 1]
-    mov edx, r14d
-    call world_get
-    lea rcx, [block_flags]
-    movzx eax, byte [rcx + rax]
-    and eax, F_SOLID | F_FENCE
-    cmp eax, F_SOLID | F_FENCE
-    jne .nx
-    cmp r12d, 1                     ; rising: only the fence itself stops it
-    jne .half
-    movss xmm0, [rsp + 32]
-    comiss xmm0, [f_zero]
-    ja .nx
-.half:
-    cvtsi2ss xmm0, r13d
-    addss xmm0, [f_half]
-    comiss xmm0, [pos + 4]          ; feet below the top of the half node?
-    jbe .nx
-    mov dword [rsp + 40], 1
-    jmp .hit
+    lea rcx, [col_buf]
+    call node_boxes
+    mov [rsp + 76], eax
+    mov dword [rsp + 72], 0
+.box:
+    mov eax, [rsp + 72]
+    cmp eax, [rsp + 76]
+    jae .nx
+    lea rax, [rax + rax*2]
+    lea r12, [col_buf]
+    lea r12, [r12 + rax*2]
+    xor ecx, ecx
+.ax:
+    movzx eax, byte [r12 + rcx]
+    cvtsi2ss xmm0, eax
+    mulss xmm0, [f_eighth]
+    cvtsi2ss xmm1, dword [rsp + 24 + rcx*4]
+    addss xmm0, xmm1
+    movss [rsp + 48 + rcx*4], xmm0  ; min
+    movzx eax, byte [r12 + rcx + 3]
+    cvtsi2ss xmm2, eax
+    mulss xmm2, [f_eighth]
+    addss xmm2, xmm1
+    movss [rsp + 60 + rcx*4], xmm2  ; max
+    ; overlap with the player's box?
+    lea rax, [pos]
+    movss xmm3, [rax + rcx*4]
+    movaps xmm4, xmm3
+    lea rax, [hi_off]
+    addss xmm3, [rax + rcx*4]
+    lea rax, [lo_off]
+    addss xmm4, [rax + rcx*4]
+    cmp ecx, [rsp + 40]
+    je .exact                       ; along the move: any overlap counts
+    subss xmm3, [f_eps]             ; across it: touching is not a hit
+    addss xmm4, [f_eps]
+    jmp .cmp
+.exact:
+    cmp ecx, 1
+    jne .cmp
+    cmp dword [rsp + 44], 0
+    jge .cmp
+    subss xmm4, [f_eps]             ; coming down: resting on it counts
+.cmp:
+    comiss xmm0, xmm3
+    jae .bn
+    comiss xmm2, xmm4
+    jbe .bn
+    inc ecx
+    cmp ecx, 3
+    jb .ax
+    ; a hit
+    mov ebx, 1
+    mov eax, [rsp + 24]
+    mov [col_cell], eax
+    mov eax, [rsp + 28]
+    mov [col_cell + 4], eax
+    mov eax, [rsp + 32]
+    mov [col_cell + 8], eax
+    movss xmm0, [rsp + 64]
+    maxss xmm0, [col_top]
+    movss [col_top], xmm0
+    mov ecx, [rsp + 40]
+    cmp dword [rsp + 44], 0
+    je .bn
+    jl .neg
+    movss xmm0, [rsp + 48 + rcx*4]  ; up to its near side
+    lea rax, [hi_off]
+    subss xmm0, [rax + rcx*4]
+    subss xmm0, [f_skin]
+    minss xmm0, [col_limit]
+    movss [col_limit], xmm0
+    jmp .bn
+.neg:
+    movss xmm0, [rsp + 60 + rcx*4]
+    lea rax, [lo_off]
+    subss xmm0, [rax + rcx*4]
+    cmp ecx, 1
+    je .negy                        ; standing on it: exactly on top
+    addss xmm0, [f_skin]
+.negy:
+    maxss xmm0, [col_limit]
+    movss [col_limit], xmm0
+.bn:
+    inc dword [rsp + 72]
+    jmp .box
 .nx:
     inc r15d
     cmp r15d, [rsp + 4]
@@ -425,36 +519,102 @@ move_axis:
     inc r13d
     cmp r13d, [rsp + 12]
     jle .ly
+    mov eax, ebx
     LEAVE_FN
-.hit:
+
+; move_axis(edi axis, xmm0 delta) - move, and stop against the shapes of
+; the nodes (whole blocks, fences 1.5 high, beds, slabs, stairs). Walking
+; into something no more than half a node high steps up onto it.
+; locals: [0] delta, [4] y before a step
+move_axis:
+    ENTER_FN 16
+    mov r12d, edi
+    movss [rsp], xmm0
     lea rbx, [pos]
-    movss xmm0, [rsp + 32]
-    comiss xmm0, [f_zero]
-    jbe .neg
-    mov eax, [rsp + r12*8 + 4]
-    cvtsi2ss xmm1, eax
-    lea rax, [hi_off]
-    subss xmm1, [rax + r12*4]
-    subss xmm1, [f_skin]
+    movss xmm1, [rbx + r12*4]
+    addss xmm1, xmm0
     movss [rbx + r12*4], xmm1
-    jmp .stop
-.neg:
-    mov eax, [rsp + r12*8]
-    inc eax
-    cvtsi2ss xmm1, eax
+    ; crouching on the ground: not off the edge of a drop deeper than a slab
     cmp r12d, 1
-    jne .neg2
-    cmp dword [rsp + 40], 0
-    je .neg2
-    subss xmm1, [f_half]            ; landed on top of a fence: 1.5 up
-.neg2:
-    lea rax, [lo_off]
-    subss xmm1, [rax + r12*4]
+    je .noedge
+    cmp dword [crouching], 0
+    je .noedge
+    cmp dword [on_ground], 0
+    je .noedge
+    mov eax, [pos + 4]
+    mov [rsp + 4], eax
+    movss xmm0, [pos + 4]
+    subss xmm0, [f_ledge]
+    movss [pos + 4], xmm0
+    mov edi, 1
+    xor esi, esi
+    call collide                    ; anything under the feet there?
+    mov ecx, [rsp + 4]
+    mov [pos + 4], ecx
+    test eax, eax
+    jnz .noedge
+    lea rbx, [pos]
+    movss xmm1, [rbx + r12*4]
+    subss xmm1, [rsp]
+    movss [rbx + r12*4], xmm1
+    lea rax, [vel]
+    mov dword [rax + r12*4], 0
+    LEAVE_FN
+.noedge:
+    mov edi, r12d
+    call .sign
+    call collide
+    test eax, eax
+    jz .free
+    ; a step up?
+    cmp r12d, 1
+    je .blocked
+    cmp dword [on_ground], 0
+    je .blocked
+    movss xmm0, [col_top]
+    subss xmm0, [pos + 4]
+    comiss xmm0, [f_zero]
+    jbe .blocked
+    comiss xmm0, [f_step]
+    ja .blocked
+    mov eax, [pos + 4]
+    mov [rsp + 4], eax
+    mov eax, [col_top]
+    mov [pos + 4], eax
+    mov edi, 1
+    xor esi, esi
+    call collide
+    test eax, eax
+    jz .free                        ; room up there: it stepped
+    mov eax, [rsp + 4]
+    mov [pos + 4], eax
+    mov edi, r12d
+    call .sign
+    call collide
+.blocked:
+    mov r15d, [col_cell]
+    mov r13d, [col_cell + 4]
+    mov r14d, [col_cell + 8]
+    lea rbx, [pos]
+    movss xmm1, [col_limit]
+    movss xmm0, [rsp]
+    comiss xmm0, [f_zero]
+    ja .stop_at
     cmp r12d, 1
     je .floor
-    addss xmm1, [f_skin]
+.stop_at:
     movss [rbx + r12*4], xmm1
     jmp .stop
+.free:
+    LEAVE_FN
+.sign:                              ; esi = the sign of the delta
+    mov esi, 1
+    movss xmm0, [rsp + 8]
+    comiss xmm0, [f_zero]
+    ja .sg
+    mov esi, -1
+.sg:
+    ret
 .floor:
     movss [rbx + 4], xmm1
     mov dword [on_ground], 1
@@ -472,11 +632,27 @@ move_axis:
     jae .stop                       ; too slow: just land
     mulss xmm0, [f_bounce]
     movss [vel + 4], xmm0
+    SFX S_BLOP, 90, 80
     jmp .stopped
 .hard:
     ; fall damage from the landing speed
     cmp dword [flying], 0
     jne .stop
+    ; coming down from a jump or a drop is heard: a thud on what is there
+    movss xmm0, [vel + 4]
+    comiss xmm0, [f_landsnd]
+    ja .soft
+    mov edi, eax
+    mov esi, 2
+    movss xmm0, [pos]
+    movss xmm1, [pos + 4]
+    movss xmm2, [pos + 8]
+    call sound_block
+    movss xmm0, [vel + 4]
+    comiss xmm0, [f_landhard]
+    ja .soft
+    SFX S_LAND, 90, 100
+.soft:
     movss xmm0, [vel + 4]
     xorps xmm1, xmm1
     subss xmm1, xmm0
@@ -502,6 +678,19 @@ update_player:
     fsincos
     fstp dword [cyaw]
     fstp dword [syaw]
+    ; the eyes go down a little crouching, up again standing
+    movss xmm0, [f_eye]
+    cmp dword [crouching], 0
+    je .eyeto
+    movss xmm0, [f_eyecr]
+.eyeto:
+    subss xmm0, [eye_h]
+    movss xmm1, [dt]
+    mulss xmm1, [f_eyerate]
+    minss xmm1, [f_one]
+    mulss xmm0, xmm1
+    addss xmm0, [eye_h]
+    movss [eye_h], xmm0
     ; in a boat: the boat moves the player (boat.asm)
     cmp dword [riding], 0
     je .afoot
@@ -512,6 +701,7 @@ update_player:
     mov [eye_water], eax
     mov [body_water], eax
     mov [flying], eax
+    mov [crouching], eax
     mov dword [on_ground], 1
     jmp .out
 .afoot:
@@ -561,6 +751,12 @@ update_player:
     lea rcx, [block_flags]
     test byte [rcx + rax], F_LIQUID
     setnz r12b                      ; r12 = body in water
+    cmp r12d, [body_water]
+    jbe .nosplash
+    cmp dword [vel + 4], 0xC0000000 ; going in, falling at 2 nodes/s or more
+    jb .nosplash
+    SFX S_SPLASH, 90, 100
+.nosplash:
     mov [body_water], r12d
     ; lava at the body or round the feet
     lea ecx, [rax - B_LAVA]
@@ -634,6 +830,7 @@ update_player:
     je .canfly
     mov dword [flying], 0
 .canfly:
+    mov dword [crouching], 0
     cmp dword [flying], 0
     je .walk
     movss xmm0, [f_fly]
@@ -650,11 +847,29 @@ update_player:
     movss [vel + 4], xmm1
     jmp .horiz
 .walk:
+    ; crouching: the sneak key, out of the water; slow, and no sprinting
+    KEY eax, rax, bind_down
+    test r12d, r12d
+    jz .cr
+    xor eax, eax
+.cr:
+    mov [crouching], eax
     movss xmm0, [f_walk]
+    test eax, eax
+    jz .notcr
+    mulss xmm0, [f_crouch]
+    jmp .w1
+.notcr:
     test r13d, r13d
     jz .w1
     movss xmm0, [f_sprint]
 .w1:
+    ; a beacon's speed: 30% faster
+    movss xmm1, [eff_time + 8]
+    comiss xmm1, [f_zero]
+    jbe .nospeed
+    mulss xmm0, [f_speedfx]
+.nospeed:
     test r12d, r12d
     jz .w2
     mulss xmm0, [f_wslow]
@@ -749,6 +964,29 @@ update_player:
     dec r13d
     jnz .sub
 
+    ; steps: walking on the ground is heard, by what it is
+    cmp dword [on_ground], 0
+    je .nostep
+    cmp dword [wall_hit], 0
+    jne .nostep
+    cmp dword [body_water], 0
+    jne .nostep
+    movss xmm0, [pos]
+    movss xmm1, [pos + 4]
+    subss xmm1, [f_under]
+    movss xmm2, [pos + 8]
+    call block_at
+    mov edi, eax
+    movss xmm0, [vel]
+    mulss xmm0, xmm0
+    movss xmm1, [vel + 8]
+    mulss xmm1, xmm1
+    addss xmm0, xmm1
+    sqrtss xmm0, xmm0
+    mulss xmm0, [dt]
+    call sound_step
+.nostep:
+
     ; fell out of the world
     movss xmm0, [pos + 4]
     comiss xmm0, [f_neg100]
@@ -768,6 +1006,10 @@ update_survival:
     subss xmm0, [dt]
     maxss xmm0, [f_zero]
     movss [hurt_flash], xmm0
+    movss xmm0, [spawn_guard]
+    subss xmm0, [dt]
+    maxss xmm0, [f_zero]
+    movss [spawn_guard], xmm0
     cmp dword [game_mode], MODE_SURVIVAL
     jne .out
     ; lava: 4 damage every half second, and on fire for 4 s after
@@ -856,7 +1098,7 @@ update_survival:
 eye_pos:
     movss xmm0, [pos]
     movss xmm1, [pos + 4]
-    addss xmm1, [f_eye]
+    addss xmm1, [eye_h]
     movss xmm2, [pos + 8]
     ret
 
@@ -910,6 +1152,9 @@ update_digging:
     ; a mob in the way is hit instead of digging (every 0.5 s while held)
     comiss xmm0, [f_zero]
     ja .hitting
+    call dragon_attack              ; (the island: a crystal, or the dragon)
+    test eax, eax
+    jnz .struck
     call mob_attack
     test eax, eax
     jnz .struck
@@ -920,6 +1165,7 @@ update_digging:
     mov eax, [f_atkcool]
     mov [atk_cool], eax
     mov dword [atk_hold], 1
+    mov dword [hand_swing], 0x3f800000
 .hitting:
     cmp dword [atk_hold], 0
     jne .reset
@@ -944,11 +1190,22 @@ update_digging:
     mov [dig_pos + 8], eax
     mov dword [dig_progress], 0
 .same:
+    ; the hand swings for as long as it digs
+    cmp dword [hand_swing], 0
+    jne .swinging
+    mov dword [hand_swing], 0x3f800000
+.swinging:
     mov edi, [target]
     mov esi, [target + 4]
     mov edx, [target + 8]
     call world_get
     mov [rsp], eax
+    mov edi, eax
+    mov esi, [target]
+    mov edx, [target + 4]
+    mov ecx, [target + 8]
+    call dig_alias
+    mov [rsp + 8], eax              ; what it digs like
     call held_item
     mov [rsp + 4], eax
     cmp dword [game_mode], MODE_CREATIVE
@@ -962,7 +1219,7 @@ update_digging:
     mov [dig_cool], eax
     jmp .break
 .survival:
-    mov edi, [rsp]
+    mov edi, [rsp + 8]
     mov esi, [rsp + 4]
     call dig_time
     comiss xmm0, [f_zero]
@@ -977,10 +1234,24 @@ update_digging:
     mulss xmm0, [f_five]
     cvttss2si eax, xmm0
     mov [dig_stage], eax
+    ; a tap now and then while it is being dug
+    movss xmm0, [dig_snd]
+    subss xmm0, [dt]
+    movss [dig_snd], xmm0
+    comiss xmm0, [f_zero]
+    ja .out
+    mov eax, [f_digsnd]
+    mov [dig_snd], eax
+    mov edi, [rsp + 8]
+    xor esi, esi
+    call target_sound
+    mov edi, [rsp + 8]
+    mov esi, 3
+    call target_bits
     jmp .out
 .dug:
     ; the drop falls out of the middle of the node
-    mov edi, [rsp]
+    mov edi, [rsp + 8]
     mov esi, [rsp + 4]
     call can_harvest
     test eax, eax
@@ -994,6 +1265,12 @@ update_digging:
     mov edi, [sel_slot]
     call tool_wear
 .break:
+    mov edi, [rsp + 8]
+    mov esi, 1
+    call target_sound
+    mov edi, [rsp + 8]
+    mov esi, 14
+    call target_bits
     ; a furnace spills what is inside it
     mov eax, [rsp]
     cmp eax, B_FURNACE
@@ -1016,6 +1293,10 @@ update_digging:
     mov esi, [target + 4]
     mov edx, [target + 8]
     call pop_above
+    mov edi, [target]
+    mov esi, [target + 4]
+    mov edx, [target + 8]
+    call pop_walls
     ; a portal next to it goes when its frame is broken
     mov edi, [target]
     mov esi, [target + 4]
@@ -1043,8 +1324,34 @@ update_digging:
     mov dword [dig_progress], 0
     mov dword [dig_cool], 0
     mov dword [dig_stage], -1
+    mov dword [dig_snd], 0
 .out:
     LEAVE_FN
+
+; target_bits(edi block, esi how many) - bits of the block looked at fly off
+target_bits:
+    sub rsp, 8
+    mov r8d, esi
+    mov esi, [target]
+    mov edx, [target + 4]
+    mov ecx, [target + 8]
+    call fx_burst
+    add rsp, 8
+    ret
+
+; target_sound(edi block, esi kind) - the sound of the block looked at
+; (kind: 0 a dig tap, 1 breaking)
+target_sound:
+    sub rsp, 8
+    cvtsi2ss xmm0, dword [target]
+    addss xmm0, [f_half]
+    cvtsi2ss xmm1, dword [target + 4]
+    addss xmm1, [f_half]
+    cvtsi2ss xmm2, dword [target + 8]
+    addss xmm2, [f_half]
+    call sound_block
+    add rsp, 8
+    ret
 
 ; drop_block(edi block, esi x, edx y, ecx z) - what breaking it gives,
 ; out of the middle of the node: its drop (gravel: flint 1 in 10), plus
@@ -1060,6 +1367,21 @@ drop_block:
     mov r12d, esi
     mov r13d, edx
     mov r14d, ecx
+    ; a door or trapdoor: wood or iron, as it was put down
+    lea eax, [rbx - W_DOOR]
+    cmp eax, W_END - W_DOOR - 1
+    ja .notdoor
+    mov edi, ebx
+    mov esi, r12d
+    mov edx, r13d
+    mov ecx, r14d
+    call door_drop
+    test eax, eax
+    jz .out                         ; (a green portal: nothing)
+    mov edi, eax
+    call .spawn
+    jmp .out
+.notdoor:
     ; gravel gives flint 1 time in 10
     cmp ebx, B_GRAVEL
     jne .normal
@@ -1145,6 +1467,10 @@ pop_above:
     lea rcx, [block_flags]
     test byte [rcx + rax], F_CROSS
     jz .out
+    cmp eax, B_TORCH_WALL
+    je .out                         ; it hangs on a wall, not on this
+    cmp eax, W_FIRST
+    jae .out                        ; bluestone parts see to themselves
     push rax
     sub rsp, 8
     mov edi, ebx
@@ -1165,6 +1491,62 @@ pop_above:
     pop r12
     pop rbx
     ret
+
+; pop_walls(edi x, esi y, edx z) - the node was dug away: a wall torch
+; beside it with no other block to hold on to comes off
+; locals: [0] x, [4] y, [8] z, [12] the torch's x, [16] z
+pop_walls:
+    ENTER_FN 32
+    mov [rsp], edi
+    mov [rsp + 4], esi
+    mov [rsp + 8], edx
+    xor r12d, r12d
+.t:
+    lea rax, [wall_dirs]
+    movsx edi, byte [rax + r12*2]
+    add edi, [rsp]
+    mov [rsp + 12], edi
+    movsx edx, byte [rax + r12*2 + 1]
+    add edx, [rsp + 8]
+    mov [rsp + 16], edx
+    mov esi, [rsp + 4]
+    call world_get
+    cmp eax, B_TORCH_WALL
+    jne .next
+    xor r13d, r13d
+.hold:
+    lea rax, [wall_dirs]
+    movsx edi, byte [rax + r13*2]
+    add edi, [rsp + 12]
+    movsx edx, byte [rax + r13*2 + 1]
+    add edx, [rsp + 16]
+    mov esi, [rsp + 4]
+    call world_get
+    lea rcx, [block_flags]
+    movzx eax, byte [rcx + rax]
+    and eax, F_SOLID | F_FENCE
+    cmp eax, F_SOLID
+    je .next                        ; still held
+    inc r13d
+    cmp r13d, 4
+    jb .hold
+    mov edi, [rsp + 12]
+    mov esi, [rsp + 4]
+    mov edx, [rsp + 16]
+    xor ecx, ecx
+    call world_set
+    cmp dword [game_mode], MODE_SURVIVAL
+    jne .next
+    mov edi, B_TORCH_WALL
+    mov esi, [rsp + 12]
+    mov edx, [rsp + 4]
+    mov ecx, [rsp + 16]
+    call drop_block
+.next:
+    inc r12d
+    cmp r12d, 4
+    jb .t
+    LEAVE_FN
 
 ; bed_partner_remove(edi x, esi y, edx z, ecx other half) - the bed half
 ; next to (x, y, z) goes (no drop: the half that was broken drops the bed)
@@ -1387,6 +1769,7 @@ player_use:
     mov edx, [target + 20]
     mov ecx, r12d
     call world_set
+    SFX S_TICK_CLOTH, 80, 100
     call use_one
     jmp .out
 .food:
@@ -1405,6 +1788,8 @@ player_use:
     cmp eax, ecx
     cmovg eax, ecx
     mov [hp], eax
+    SFX S_EAT, 100, 100
+    mov dword [hand_swing], 0x3f800000
     mov eax, [sel_slot]
     lea rcx, [inv]
     lea rcx, [rcx + rax*4]
@@ -1446,6 +1831,7 @@ player_use:
     call mob_spawn
     test eax, eax
     js .out                         ; too many mobs
+    SFX S_POP, 80, 80
     cmp dword [game_mode], MODE_SURVIVAL
     jne .out                        ; creative keeps the egg
     mov eax, [sel_slot]
@@ -1460,6 +1846,34 @@ player_use:
     mov esi, [target + 4]
     mov edx, [target + 8]
     call world_get
+    ; crouching with something in the hand: it is put down against the
+    ; block, which is not opened or used
+    cmp dword [crouching], 0
+    je .opens
+    mov ebx, eax
+    call held_item
+    test eax, eax
+    mov eax, ebx
+    jnz .placeonly
+.opens:
+    ; a lever, button, repeater or comparator answers the click
+    cmp eax, W_FIRST
+    jb .nopart
+    cmp eax, B_UNKNOWN
+    jae .nopart
+    mov r12d, eax
+    mov edi, eax
+    mov esi, [target]
+    mov edx, [target + 4]
+    mov ecx, [target + 8]
+    call wire_click
+    test eax, eax
+    jz .waspart
+    mov dword [hand_swing], 0x3f800000
+    jmp .out
+.waspart:
+    mov eax, r12d
+.nopart:
     cmp eax, B_CRAFTTABLE
     je .table
     cmp eax, B_FURNACE
@@ -1472,10 +1886,13 @@ player_use:
     je .sleep
     cmp eax, B_DYEMAKER
     je .dyemaker
+    cmp eax, B_BEACON
+    je .beacon
     ; a fence gate opens or closes
     lea ecx, [rax - B_GATE_X]
     cmp ecx, B_GATEOPEN_Z - B_GATE_X
     jbe .gate
+.placeonly:
     mov ebx, eax                    ; target block
     call held_item
     mov r12d, eax
@@ -1506,6 +1923,8 @@ player_use:
     mov edx, [target + 8]
     mov ecx, B_FARMLAND
     call world_set
+    SFX S_TICK_DIRT, 85, 85
+    mov dword [hand_swing], 0x3f800000
     cmp dword [game_mode], MODE_SURVIVAL
     jne .out
     mov edi, [sel_slot]
@@ -1514,12 +1933,39 @@ player_use:
 .nohoe:
     cmp r12d, I_BED
     je .placebed
+    cmp r12d, I_DRAGONPORTAL        ; in the nether: the frame of a portal
+    jne .notdp
+    call portal_item
+    test eax, eax
+    jz .out
+    mov dword [target_hit], 0
+    jmp .used
+.notdp:
+    ; birch and dark oak logs and planks: their blocks
+    lea eax, [r12 - I_BIRCHLOG]
+    cmp eax, I_DARKPLANKS - I_BIRCHLOG
+    ja .notwood
+    add r12d, ITEM_TO_W
+    jmp .wood
+.notwood:
+    ; bluestone parts, rails, minecarts, doors, stairs, slabs and chests
+    lea eax, [r12 - I_DUST]
+    cmp eax, I_CHEST - I_DUST
+    ja .notpart
+    mov edi, r12d
+    call wire_use_item
+    test eax, eax
+    jz .out
+    mov dword [target_hit], 0
+    jmp .used
+.notpart:
     cmp r12d, I_FIRST
     jae .out                        ; items are not placed
     mov edi, r12d
     call item_valid
     test eax, eax
     jz .out
+.wood:
     xor ebx, ebx
 .ax:
     lea rax, [target]
@@ -1561,13 +2007,48 @@ player_use:
     mov esi, [target + 16]
     mov edx, [target + 20]
     call world_set
+    SFX S_TICK_WOOD, 85, 78
     jmp .used
 .placeit:
+    ; a torch: standing on top of a block, leaning from its side, never
+    ; hung under one
+    cmp r12d, B_TORCH
+    jne .putit
+    mov eax, [target + 16]
+    cmp eax, [target + 4]
+    jl .out
+    je .walltorch
+    mov edi, [target]
+    mov esi, [target + 4]
+    mov edx, [target + 8]
+    call world_get
+    lea rcx, [block_flags]
+    test byte [rcx + rax], F_SOLID
+    jz .out                         ; (not on a plant or another torch)
+    jmp .putit
+.walltorch:
+    mov edi, [target]
+    mov esi, [target + 4]
+    mov edx, [target + 8]
+    call world_get
+    lea rcx, [block_flags]
+    movzx eax, byte [rcx + rax]
+    and eax, F_SOLID | F_FENCE
+    cmp eax, F_SOLID
+    jne .out
+    mov r12d, B_TORCH_WALL
+.putit:
     mov edi, [target + 12]
     mov esi, [target + 16]
     mov edx, [target + 20]
     mov ecx, r12d
     call world_set
+    mov edi, r12d
+    mov esi, 2
+    cvtsi2ss xmm0, dword [target + 12]
+    cvtsi2ss xmm1, dword [target + 16]
+    cvtsi2ss xmm2, dword [target + 20]
+    call sound_block
     mov dword [target_hit], 0
     cmp r12d, B_FURNACE
     jne .used
@@ -1576,6 +2057,7 @@ player_use:
     mov edx, [target + 20]
     call furnace_add
 .used:
+    mov dword [hand_swing], 0x3f800000
     cmp dword [game_mode], MODE_SURVIVAL
     jne .out
     mov eax, [sel_slot]
@@ -1591,6 +2073,12 @@ player_use:
 .dyemaker:
     mov edi, GS_DYE
     call invui_open
+    jmp .out
+.beacon:
+    mov edi, [target]
+    mov esi, [target + 4]
+    mov edx, [target + 8]
+    call beacon_open
     jmp .out
 .sleep:
     mov edi, [target]
@@ -1656,6 +2144,7 @@ player_use:
     add edx, r14d
     mov ecx, B_BED_HEAD
     call world_set
+    SFX S_TICK_WOOD, 85, 78
     mov dword [target_hit], 0
     call use_one
     jmp .out
@@ -1670,6 +2159,8 @@ player_use:
     mov esi, [target + 4]
     mov edx, [target + 8]
     call world_set
+    SFX S_TICK_WOOD, 80, 115
+    mov dword [hand_swing], 0x3f800000
     jmp .out
 .furnace:
     mov edi, [target]

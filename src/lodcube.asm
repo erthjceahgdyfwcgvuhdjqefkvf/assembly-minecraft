@@ -1,18 +1,3 @@
-; lodcube.asm - the near horizon rings as big textured cubes.
-;
-; Just outside the real chunks the far terrain is drawn as cubes 8 nodes
-; wide, further out 16 wide (one per chunk), before the smooth shell takes
-; over. Each column is the exact ground height plus the solid 8-node
-; mountain levels above it, so overhangs and floating islands keep the air
-; under them. Faces use the block atlas (grass, dirt, stone, snow, sand,
-; water), walls appear wherever the neighbouring column (real, cube or
-; smooth) is lower, so nothing is left open between the rings.
-;
-; Positions are in 1/8 nodes from the tile corner, like the smooth shell;
-; texture coordinates are atlas texels at 16 px (the unit-2 texture matrix
-; scales them), one 8 x 8 repeat per face: 16-node cubes show the
-; textures at half resolution.
-
 %include "common.inc"
 
 global build_cubes, cz_buf, cz_n, cube_r1sq, cube_r2sq
@@ -29,6 +14,8 @@ CLS_CUBE8   equ 1
 CLS_CUBE16  equ 2
 CLS_SMOOTH  equ 3
 MAXIV       equ 20                  ; solid intervals per column (17 at most)
+FACE_MARGIN equ 56                  ; nodes: see build_cubes (horizon.asm rebuilds
+                                    ; a tile with cubes 3 chunks of walking on)
 
 section .rodata
 align 4
@@ -43,7 +30,7 @@ cube_r2sq:  resd 1                  ; 16-node cubes inside, smooth beyond
 cw_ground:  resd HZ_DATA            ; per cell: top solid node of the ground
 cw_mask:    resd HZ_DATA            ; solid mountain levels above it
 cw_far:     resd HZ_DATA            ; height the smooth shell uses
-cw_top:     resb HZ_DATA            ; top block, bit 7 forest
+cw_top:     resb HZ_DATA            ; top block, bit 7 forest (its trees: bits 5-6)
 cw_cls:     resb HZ_DATA            ; CLS_*
 alignb 4
 iv_a:       resd MAXIV * 2          ; this column: [bottom, top) node pairs
@@ -66,6 +53,13 @@ c_ui:       resd 1                  ; this interval index
 c_cur:      resd 1
 c_i:        resd 1                  ; cell in the tile, 0..31
 c_j:        resd 1
+c_tile:     resd 1                  ; the tile's slot (makes its trees its own)
+; a tree's box: x0, x1, z0, z1 (1/8 nodes in the tile), y0, y1
+t_box:      resd 6
+lim_px:     resd 1                  ; where each side's faces can be seen from
+lim_nx:     resd 1
+lim_pz:     resd 1
+lim_nz:     resd 1
 ; one quad: 4 x (x, y, z, u, v), colour
 q_c:        resd 20
 q_col:      resd 1
@@ -197,7 +191,7 @@ interval_block:
     mov eax, [c_w]
     lea rcx, [cw_top]
     movzx eax, byte [rcx + rax]
-    and eax, 0x7f
+    and eax, 0x1f
     mov ecx, [c_itop]
     cmp ecx, SNOWLINE + 1
     jl .b
@@ -244,6 +238,8 @@ cell_tops:
     lea rcx, [cw_top]
     test byte [rcx + rax], 0x80
     jz .lit
+    cmp dword [c_sc], CLS_CUBE8
+    je .lit                         ; close by the trees themselves stand on it
     cmp dword [c_block], B_SNOW
     je .lit
     cmp dword [c_block], B_DSAND
@@ -299,6 +295,221 @@ cell_tops:
     add rsp, 8
     pop r12
     pop rbx
+    ret
+
+; ---------------------------------------------------------------------------
+; Trees on the 8-node cubes of a forest: where the real chunks end the
+; forest goes on, as one plain tree a cell (a trunk and a block of leaves
+; or needles, 9 faces), each cell's own in place and height.
+cell_trees:
+    push rbx
+    push r12
+    push r13
+    mov eax, [c_w]
+    lea rcx, [cw_top]
+    movzx eax, byte [rcx + rax]
+    test eax, 0x80
+    jz .out
+    cmp dword [n_a], 1
+    jne .out                        ; under a mountain's overhang: none
+    mov r12d, eax
+    shr r12d, 5
+    and r12d, 3                     ; 1 apple, 2 pine, 3 jungle
+    jz .out
+    and eax, 0x1f
+    cmp eax, B_WATER
+    je .out
+    cmp dword [cz_n], HZ_CMAXV - 1024
+    ja .out
+    ; this cell's own numbers
+    imul eax, [c_i], 73856093
+    imul ecx, [c_j], 19349663
+    xor eax, ecx
+    imul ecx, [c_tile], 83492791
+    xor eax, ecx
+    imul eax, eax, 1103515245
+    add eax, 12345
+    mov r13d, eax
+    shr r13d, 8                     ; 24 bits to take from
+    ; the trunk: one node square, 1 .. 5 nodes into the cell
+    mov eax, r13d
+    xor edx, edx
+    mov ecx, 5
+    div ecx
+    mov r13d, eax
+    lea eax, [rdx*8 + 8]
+    add eax, [c_x0]
+    mov [t_box], eax
+    add eax, 8
+    mov [t_box + 4], eax
+    mov eax, r13d
+    xor edx, edx
+    mov ecx, 5
+    div ecx
+    mov r13d, eax
+    lea eax, [rdx*8 + 8]
+    add eax, [c_z0]
+    mov [t_box + 8], eax
+    add eax, 8
+    mov [t_box + 12], eax
+    and r13d, 3                     ; 0 .. 3 taller
+    mov ebx, [iv_a + 4]             ; the ground's top (nodes)
+    cmp r12d, 2
+    je .pine
+    ; apple or jungle tree: trunk 3 (jungle 6) + 0..1, a crown 5 x 5 x 3
+    mov eax, r13d
+    and eax, 1
+    add eax, 3
+    cmp r12d, 3
+    jne .at
+    add eax, 3
+.at:
+    add eax, ebx
+    mov r13d, eax                   ; where the crown starts
+    mov edi, B_LOG
+    mov esi, ebx
+    mov edx, r13d
+    xor ecx, ecx
+    call tree_box
+    sub dword [t_box], 16
+    add dword [t_box + 4], 16
+    sub dword [t_box + 8], 16
+    add dword [t_box + 12], 16
+    mov edi, B_LEAVES
+    mov esi, r13d
+    lea edx, [r13 + 3]
+    mov ecx, 1
+    call tree_box
+    jmp .out
+.pine:
+    ; pine: needles 3 x 3 and 5 .. 8 tall from one node up (its short
+    ; trunk is not seen from this far)
+    sub dword [t_box], 8
+    add dword [t_box + 4], 8
+    sub dword [t_box + 8], 8
+    add dword [t_box + 12], 8
+    mov edi, B_PINENEEDLES
+    lea esi, [rbx + 1]
+    lea edx, [rbx + r13 + 6]
+    mov ecx, 1
+    call tree_box
+.out:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; tree_box(edi block, esi y0, edx y1 (nodes), ecx 1 = with a top) - the
+; four sides of the box t_box from y0 to y1 with the block's side texture
+tree_box:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub rsp, 8
+    mov r14d, ecx
+    mov r12d, esi
+    mov r13d, edx
+    mov [t_box + 16], esi
+    mov [t_box + 20], edx
+    call tiles_of
+    shr eax, 8
+    movzx r15d, al                  ; side tile
+    ; texels: 16 a node across and up (never more than a tile: 8 nodes)
+    mov edi, r15d
+    call tile_uv                    ; esi tu, edi tv
+    mov ebp, esi                    ; u0
+    mov ebx, edi                    ; v at the top
+    mov eax, r13d
+    sub eax, r12d
+    cmp eax, 8
+    jle .h
+    mov eax, 8
+.h:
+    shl eax, 4
+    lea r15d, [rbx + rax]           ; v at the bottom
+    shl r12d, 3                     ; y in 1/8 nodes
+    shl r13d, 3
+    mov r8d, [t_box]
+    mov r10d, [t_box + 4]
+    mov r9d, [t_box + 8]
+    mov r11d, [t_box + 12]
+    mov ecx, r10d
+    sub ecx, r8d
+    shl ecx, 1                      ; 1/8 nodes -> texels
+    add ecx, ebp                    ; u1
+    cmp r10d, [lim_px]
+    jge .s1
+    QC 0, r10d, r12d, r11d, ebp, r15d
+    QC 1, r10d, r12d, r9d, ecx, r15d
+    QC 2, r10d, r13d, r9d, ecx, ebx
+    QC 3, r10d, r13d, r11d, ebp, ebx
+    mov edi, 204
+    call .emit
+.s1:
+    cmp r8d, [lim_nx]
+    jle .s2
+    QC 0, r8d, r12d, r9d, ebp, r15d
+    QC 1, r8d, r12d, r11d, ecx, r15d
+    QC 2, r8d, r13d, r11d, ecx, ebx
+    QC 3, r8d, r13d, r9d, ebp, ebx
+    mov edi, 204
+    call .emit
+.s2:
+    cmp r11d, [lim_pz]
+    jge .s3
+    QC 0, r8d, r12d, r11d, ebp, r15d
+    QC 1, r10d, r12d, r11d, ecx, r15d
+    QC 2, r10d, r13d, r11d, ecx, ebx
+    QC 3, r8d, r13d, r11d, ebp, ebx
+    mov edi, 170
+    call .emit
+.s3:
+    cmp r9d, [lim_nz]
+    jle .s4
+    QC 0, r10d, r12d, r9d, ebp, r15d
+    QC 1, r8d, r12d, r9d, ecx, r15d
+    QC 2, r8d, r13d, r9d, ecx, ebx
+    QC 3, r10d, r13d, r9d, ebp, ebx
+    mov edi, 170
+    call .emit
+.s4:
+    test r14d, r14d
+    jz .out
+    lea eax, [rbx + rcx]
+    sub eax, ebp                    ; v across the top: as wide as u
+    QC 0, r8d, r13d, r9d, ebp, ebx
+    QC 1, r8d, r13d, r11d, ebp, eax
+    QC 2, r10d, r13d, r11d, ecx, eax
+    QC 3, r10d, r13d, r9d, ecx, ebx
+    mov edi, 255
+    call .emit
+.out:
+    add rsp, 8
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.emit:
+    ; (keeps the registers the corners are built from)
+    push rcx
+    push r8
+    push r9
+    push r10
+    push r11
+    call shade_col
+    mov [q_col], eax
+    call emit_quad
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rcx
     ret
 
 ; one wall quad of direction c_dir from y edi up to esi (nodes), tile edx
@@ -451,6 +662,33 @@ cell_walls:
     push r13
     push r14
     push r15
+    ; a wall the player cannot get in front of is left out
+    mov eax, [c_dir]
+    cmp eax, 1
+    je .fnx
+    cmp eax, 2
+    je .fpz
+    cmp eax, 3
+    je .fnz
+    mov ecx, [c_x1]
+    cmp ecx, [lim_px]
+    jge .out
+    jmp .faces
+.fnx:
+    mov ecx, [c_x0]
+    cmp ecx, [lim_nx]
+    jle .out
+    jmp .faces
+.fpz:
+    mov ecx, [c_z1]
+    cmp ecx, [lim_pz]
+    jge .out
+    jmp .faces
+.fnz:
+    mov ecx, [c_z0]
+    cmp ecx, [lim_nz]
+    jle .out
+.faces:
     mov eax, [c_dir]
     lea rcx, [dir_off]
     mov edx, [c_w]
@@ -555,6 +793,28 @@ cell_walls:
 ; locals: [0] tile chunk x, [4] tile chunk z
 build_cubes:
     ENTER_FN 16
+    mov [c_tile], edi
+    ; faces turned away from the player are never seen from this far, even
+    ; after FACE_MARGIN nodes of walking (the tile is rebuilt before that):
+    ; a +x face shows only left of lim_px, a -x face right of lim_nx ...
+    mov eax, [cur_pcx]
+    sub eax, esi
+    shl eax, 4                      ; the player's chunk, nodes from the tile corner
+    lea ecx, [rax + 16 + FACE_MARGIN]
+    shl ecx, 3
+    mov [lim_px], ecx
+    lea ecx, [rax - FACE_MARGIN]
+    shl ecx, 3
+    mov [lim_nx], ecx
+    mov eax, [cur_pcz]
+    sub eax, edx
+    shl eax, 4
+    lea ecx, [rax + 16 + FACE_MARGIN]
+    shl ecx, 3
+    mov [lim_pz], ecx
+    lea ecx, [rax - FACE_MARGIN]
+    shl ecx, 3
+    mov [lim_nz], ecx
     mov r12d, edi
     imul eax, r12d, HZ_DATA * 8
     lea r13, [hz_cols]
@@ -576,7 +836,7 @@ build_cubes:
     movzx r10d, byte [r14 + r15]
     movsx r11d, word [rbx + r15*2]  ; height of the smooth shell
     mov eax, r10d
-    and eax, 0x7f
+    and eax, 0x1f
     cmp eax, B_WATER
     jne .fa1
     mov r9d, WATER_LEVEL            ; water: solid up to its surface
@@ -645,7 +905,7 @@ build_cubes:
 %macro WCNT 1
     movzx eax, byte [rdx + rcx + %1]
     mov esi, eax
-    and esi, 0x7f
+    and esi, 0x1f
     cmp esi, B_WATER
     jne %%land
     inc r8d
@@ -681,7 +941,7 @@ build_cubes:
 .landtop:
 %macro LANDTOP 1
     movzx eax, byte [rdx + rcx + %1]
-    and eax, 0x7f
+    and eax, 0x1f
     cmp eax, B_WATER
     jne %%k
     mov [rdx + rcx + %1], r9b
@@ -785,6 +1045,9 @@ build_cubes:
     add dword [c_tz1], 64
 .tops:
     call cell_tops
+    cmp dword [c_sc], CLS_CUBE8
+    jne .walls
+    call cell_trees
 .walls:
     mov dword [c_dir], 0
     call cell_walls

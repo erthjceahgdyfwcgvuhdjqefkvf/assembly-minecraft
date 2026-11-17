@@ -1,22 +1,3 @@
-; mesh.asm - greedy, multi-resolution chunk mesher.
-;
-; mesh_chunk(slot, scale) builds a chunk at full detail (scale 1) or as a
-; coarser far-terrain mesh (scale 2 or 4: each cell stands for 2x2x2 or
-; 4x4x4 nodes). Steps:
-;   1. copy (or downsample) the chunk plus a one-cell border taken from the
-;      four neighbours into a padded cell grid
-;   2. for each face direction and slice, build a mask of visible faces
-;      keyed by texture, light, part and liquid height
-;   3. merge equal keys greedily into rectangles of up to 8x8 nodes (the
-;      atlas repeats every texture 8x8, so a merged quad tiles correctly)
-;
-; Output buffers (16-byte vertices, see common.inc):
-;   surf - faces open to the sky or near it, binned per face direction
-;   deep - faces more than 12 nodes under the column top (drawn near only)
-;   wat  - liquid faces (blended pass)
-; The Xpress 1150 has no hardware vertex processing; fewer, larger quads
-; are what makes long view distances affordable on it.
-
 %include "common.inc"
 
 global mesh_chunk, mesh_buf_surf, mesh_buf_deep, mesh_buf_wat
@@ -45,6 +26,7 @@ FR_SIZE     equ 32
 ; mask key: bit 31 | tile (0-7) | sky (8-11) | block light (12-15) |
 ; part (16-17) | liquid height (18-21)
 K_SKY       equ 8
+DEEP_SKY    equ 3                   ; sky light below this (of 15): a cave's inside
 K_BLK       equ 12
 K_PART      equ 16
 K_HEIGHT    equ 18
@@ -79,6 +61,24 @@ cross_quads:
     db 14,0,14, 2,0,2,    2,16,2,    14,16,14
     db 14,0,2,  2,0,14,   2,16,14,   14,16,2
     db 2,0,14,  14,0,2,   14,16,2,   2,16,14
+; a torch: 5 quads x 4 corners of (x, end, z, u, v): x and z 0 or 1 across
+; the post (1/8 node wide), end 0 its foot or 1 its top, u and v texels in
+; the torch tile (stick and flame in columns 7-8, rows 3-15)
+TORCH_U     equ (39 & 15) * 128
+TORCH_V     equ (39 >> 4) * 128
+torch_verts:
+    db 1,0,1, 7,16,  1,0,0, 9,16,  1,1,0, 9,3,  1,1,1, 7,3      ; +x
+    db 0,0,0, 7,16,  0,0,1, 9,16,  0,1,1, 9,3,  0,1,0, 7,3      ; -x
+    db 0,0,1, 7,16,  1,0,1, 9,16,  1,1,1, 9,3,  0,1,1, 7,3      ; +z
+    db 1,0,0, 7,16,  0,0,0, 9,16,  0,1,0, 9,3,  1,1,0, 7,3      ; -z
+    db 0,1,0, 7,3,   0,1,1, 7,5,   1,1,1, 9,5,  1,1,0, 9,3      ; the top: flame
+; on a wall: the neighbour (dx, dz) it holds on to, where its foot is and
+; where its top (x, z in 1/8 nodes), 2 spare
+torch_lean:
+    db -1, 0,  0, 4,  2, 4,  0, 0
+    db  1, 0,  7, 4,  5, 4,  0, 0
+    db  0, -1, 4, 0,  4, 2,  0, 0
+    db  0, 1,  4, 7,  4, 5,  0, 0
 ; fences and gates: boxes x0 y0 z0 x1 y1 z1 in 1/8 nodes
 fence_post: db 3,0,3, 5,8,5
 fence_bars:                         ; two rails toward +x, -x, +z, -z
@@ -86,6 +86,7 @@ fence_bars:                         ; two rails toward +x, -x, +z, -z
     db 0,3,3, 3,4,5,   0,6,3, 3,7,5
     db 3,3,5, 5,4,8,   3,6,5, 5,7,8
     db 3,3,0, 5,4,3,   3,6,0, 5,7,3
+bed_pillow: db 123, 124, 94, 122   ; head tile for a foot at +x, -x, +z, -z
 fence_dir:  db 1,0, -1,0, 0,1, 0,-1 ; neighbour offsets x, z (as bytes)
 gate_x:     db 0,3,3, 1,8,5,   7,3,3, 8,8,5,   1,3,3, 7,4,5,   1,6,3, 7,7,5,   3,4,3, 5,6,5
 gate_z:     db 3,3,0, 5,8,1,   3,3,7, 5,8,8,   3,3,1, 5,4,7,   3,6,1, 5,7,7,   3,4,3, 5,6,5
@@ -116,6 +117,7 @@ n_wat:          resd 1
 m_miny8:        resd 1
 ; current chunk geometry
 m_s:            resd 1              ; nodes per cell
+m_nomerge:      resd 1              ; every face on its own (no T-junctions)
 m_n:            resd 1              ; cells per horizontal side
 m_xs:           resd 1              ; grid stride for x (= cells high + 2)
 m_zs:           resd 1              ; grid stride for z
@@ -139,6 +141,8 @@ fb_oz:          resd 1
 fb_light:       resd 1
 fb_tu:          resd 1
 fb_tv:          resd 1
+fb_tut:         resd 1              ; the texture of the top and bottom faces
+fb_tvt:         resd 1
 ; current face
 f_rec:          resq 1
 f_d:            resd 1
@@ -650,6 +654,140 @@ emit_cross:
     pop rbx
     ret
 
+; emit_torch(lx edi, yi esi, lz edx, block ecx, light byte r8d) - a torch
+; as a little post with the flame on top: standing in the middle of its
+; node, or (B_TORCH_WALL) its foot against the solid block beside it and
+; leaning away. 5 quads into the +Y bin, always bright.
+; locals: [0] x, [4] y, [8] z of the node (1/8 nodes), [12] foot x, [16]
+;         foot z, [20] top x, [24] top z, [28] foot y, [32] top y,
+;         [36] colour, [40] colour of the x sides, [44] block
+emit_torch:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 48
+    mov r12d, edi
+    mov r13d, esi
+    mov r14d, edx
+    mov [rsp + 44], ecx
+    lea eax, [rdi*8]
+    mov [rsp], eax
+    lea eax, [rsi + WORLD_YMIN]
+    shl eax, 3
+    mov [rsp + 4], eax
+    lea eax, [rdx*8]
+    mov [rsp + 8], eax
+    ; its own light and the daylight on it
+    mov eax, r8d
+    and eax, 15
+    mov ecx, 15
+    mov edx, 255
+    call light_colour
+    mov [rsp + 36], eax
+    mov eax, r8d
+    and eax, 15
+    mov ecx, 15
+    mov edx, 215
+    call light_colour
+    mov [rsp + 40], eax
+    ; standing
+    mov dword [rsp + 12], 4
+    mov dword [rsp + 16], 4
+    mov dword [rsp + 20], 4
+    mov dword [rsp + 24], 4
+    mov dword [rsp + 28], 0
+    mov dword [rsp + 32], 6
+    cmp dword [rsp + 44], B_TORCH_WALL
+    jne .build
+    ; on a wall: against the first solid block of -x, +x, -z, +z
+    xor ebx, ebx
+.side:
+    lea rax, [torch_lean]
+    movsx edi, byte [rax + rbx*8]
+    add edi, r12d
+    add edi, [m_wx]
+    lea esi, [r13 + WORLD_YMIN]
+    movsx edx, byte [rax + rbx*8 + 1]
+    add edx, r14d
+    add edx, [m_wz]
+    call world_get
+    lea rcx, [block_flags]
+    movzx eax, byte [rcx + rax]
+    and eax, F_SOLID | F_FENCE
+    cmp eax, F_SOLID
+    je .lean
+    inc ebx
+    cmp ebx, 4
+    jb .side
+    jmp .build                      ; nothing to hold on to: it stands
+.lean:
+    lea rax, [torch_lean]
+    movzx ecx, byte [rax + rbx*8 + 2]
+    mov [rsp + 12], ecx
+    movzx ecx, byte [rax + rbx*8 + 3]
+    mov [rsp + 16], ecx
+    movzx ecx, byte [rax + rbx*8 + 4]
+    mov [rsp + 20], ecx
+    movzx ecx, byte [rax + rbx*8 + 5]
+    mov [rsp + 24], ecx
+    mov dword [rsp + 28], 1
+    mov dword [rsp + 32], 7
+.build:
+    mov eax, [n_bin + 8]
+    cmp eax, MESH_BIN_CAP - 20
+    ja .full
+    lea rdi, [surf_bins]
+    add rdi, 2 * MESH_BIN_CAP * VERT_SIZE
+    shl rax, 4
+    add rdi, rax
+    add dword [n_bin + 8], 20
+    lea rsi, [torch_verts]
+    xor ebx, ebx
+.v:
+    ; foot or top end of the post
+    movzx ecx, byte [rsi + 1]
+    mov eax, [rsp + 12 + rcx*8]     ; foot x / top x
+    movzx edx, byte [rsi]
+    add eax, edx
+    add eax, [rsp]
+    mov [rdi], ax
+    mov eax, [rsp + 28 + rcx*4]
+    add eax, [rsp + 4]
+    mov [rdi + 2], ax
+    mov eax, [rsp + 16 + rcx*8]
+    movzx edx, byte [rsi + 2]
+    add eax, edx
+    add eax, [rsp + 8]
+    mov [rdi + 4], ax
+    mov word [rdi + 6], 0
+    movzx eax, byte [rsi + 3]
+    add eax, TORCH_U
+    mov [rdi + 8], ax
+    movzx eax, byte [rsi + 4]
+    add eax, TORCH_V
+    mov [rdi + 10], ax
+    mov eax, [rsp + 36]
+    cmp ebx, 8
+    jae .col
+    mov eax, [rsp + 40]             ; the two x sides a little darker
+.col:
+    mov [rdi + 12], eax
+    add rdi, VERT_SIZE
+    add rsi, 5
+    inc ebx
+    cmp ebx, 20
+    jb .v
+.full:
+    add rsp, 48
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; fbox(rdi -> x0 y0 z0 x1 y1 z1 bytes, 1/8 nodes in the node at fb_o*):
 ; six textured faces into the +Y bin (the planks texture, 2 texels per
 ; 1/8 node), lit by fb_light
@@ -725,10 +863,18 @@ fbox:
     mov ecx, [rsp + 8]
 .uv:
     shl eax, 1
-    add eax, [fb_tu]
-    mov [rdi + 8], ax
     shl ecx, 1
-    add ecx, [fb_tv]
+    mov edx, [fb_tu]
+    mov esi, [fb_tv]
+    lea r8d, [r13 - 2]
+    cmp r8d, 2
+    jae .uvside
+    mov edx, [fb_tut]
+    mov esi, [fb_tvt]
+.uvside:
+    add eax, edx
+    mov [rdi + 8], ax
+    add ecx, esi
     mov [rdi + 10], cx
     mov [rdi + 12], r15d
     add rdi, VERT_SIZE
@@ -781,10 +927,43 @@ emit_fence:
     shr eax, 4
     shl eax, 7
     mov [fb_tv], eax
+    mov eax, [fb_tu]
+    mov [fb_tut], eax
+    mov eax, [fb_tv]
+    mov [fb_tvt], eax
     cmp ebx, B_BED_FOOT
     jb .notbed
     cmp ebx, B_BED_HEAD
     ja .notbed
+    cmp ebx, B_BED_HEAD
+    jne .bedbox
+    ; the pillow lies at the end away from the foot: one head tile per way
+    xor r15d, r15d
+.bedway:
+    lea rax, [fence_dir]
+    movsx edi, byte [rax + r15*2]
+    add edi, r12d
+    mov esi, r13d
+    movsx edx, byte [rax + r15*2 + 1]
+    add edx, r14d
+    call world_get
+    cmp eax, B_BED_FOOT
+    je .bedfound
+    inc r15d
+    cmp r15d, 4
+    jb .bedway
+    jmp .bedbox
+.bedfound:
+    lea rax, [bed_pillow]
+    movzx eax, byte [rax + r15]
+    mov ecx, eax
+    and ecx, 15
+    shl ecx, 7
+    mov [fb_tut], ecx
+    shr eax, 4
+    shl eax, 7
+    mov [fb_tvt], eax
+.bedbox:
     lea rdi, [bed_box]
     call fbox
     jmp .out
@@ -848,8 +1027,8 @@ emit_fence:
 ; eax = rgba for sky level eax, block level ecx, face shade edx (0-255)
 ; clobbers rcx, rdx, r9, r10
 light_colour:
-    cmp dword [dimension], 0
-    je .lit
+    cmp dword [dimension], 1
+    jne .lit
     mov r9d, NETHER_LIGHT           ; the nether: never quite dark
     cmp ecx, r9d
     cmovb ecx, r9d
@@ -1074,6 +1253,17 @@ mesh_face:
     add eax, [m_deep]
     cmp eax, edx
     jge .have_part
+    ; far under the top of its column - but where daylight still gets in
+    ; (under an overhang, an arch, a cave mouth) it is seen from outside,
+    ; from far off too: only what is in the dark is cave geometry
+    cmp dword [m_s], 1
+    jne .deep
+    mov eax, r9d
+    shr eax, K_SKY
+    and eax, 15
+    cmp eax, DEEP_SKY
+    jae .have_part
+.deep:
     mov r11d, PART_DEEP
 .have_part:
     ; tile
@@ -1107,6 +1297,10 @@ mesh_face:
     mov eax, ebx
     div dword [m_s]
     mov ebx, eax                    ; max cells per side (8 nodes)
+    cmp dword [m_nomerge], 0
+    je .merging
+    mov ebx, 1                      ; near the player: one face each
+.merging:
     xor r15d, r15d                  ; b
 .gb:
     cmp r15d, [rsp + 24]
@@ -1208,6 +1402,11 @@ mesh_chunk:
     call mesh_set_leaves_opaque
 .fl:
     mov esi, [rsp + 4]
+    mov eax, esi
+    and eax, 0x80
+    mov [m_nomerge], eax            ; near the player: no merged faces
+    and esi, 0x7f
+    mov [rsp + 4], esi              ; (the flag goes back in CI_SCALE at the end)
     mov [m_s], esi
     mov eax, 16
     xor edx, edx
@@ -1420,7 +1619,19 @@ mesh_chunk:
     call emit_fence
     jmp .xyn
 .xcross:
+    cmp ecx, W_FIRST
+    jae .xpart
+    cmp ecx, B_TORCH
+    je .xtorch
+    cmp ecx, B_TORCH_WALL
+    je .xtorch
     call emit_cross
+    jmp .xyn
+.xtorch:
+    call emit_torch
+    jmp .xyn
+.xpart:
+    call emit_part
 .xyn:
     inc r14d
     jmp .xy
@@ -1457,7 +1668,10 @@ mesh_chunk:
     sar eax, 3
     mov [rbx + CI_MINY], eax
     mov eax, [rsp + 4]
+    or eax, [m_nomerge]
     mov [rbx + CI_SCALE], al
     LEAVE_FN
+
+%include "wiremesh.inc"
 
 NOEXECSTACK

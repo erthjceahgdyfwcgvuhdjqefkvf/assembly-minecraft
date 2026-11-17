@@ -1,22 +1,3 @@
-; winabi.asm - the Windows (XP x64) side of the C library and OpenGL calls.
-;
-; The game is written for the System V calling convention (Linux): integer
-; arguments in rdi, rsi, rdx, rcx, r8, r9, floats in xmm0-7 counted on
-; their own. 64-bit Windows passes the first four arguments by position in
-; rcx, rdx, r8, r9 / xmm0-3, the rest on the stack above 32 bytes of
-; "shadow space", and wants the stack 16-byte aligned at every call.
-;
-; So every C library and OpenGL function the game calls is defined here
-; under its usual name: it lines the stack up, moves the arguments to where
-; Windows wants them and calls the real function. The real functions come
-; from opengl32.dll and msvcrt.dll, loaded at startup (win_imports_init) -
-; not linked by name, since this file uses those names itself. A few
-; POSIX calls are rebuilt from Windows ones: clock_gettime, usleep, open
-; (binary mode), opendir/readdir, and the GLX extension lookup, which
-; returns little adapters for the Windows-convention entry points.
-; write() goes only to the debugger (a window program has no terminal,
-; and no log file is left next to the game).
-
 %include "common.inc"
 
 %ifdef VOXASM_WIN
@@ -58,6 +39,8 @@ extern __imp_MessageBoxA, __imp_OutputDebugStringA, __imp_GetSystemInfo
     FN glFogf, 0
     FN glFogfv, 0
     FN glFogi, 0
+    FN glPolygonMode, 0
+    FN glPolygonOffset, 0
     FN glFrustum, 0
     FN glGenLists, 0
     FN glGenTextures, 0
@@ -235,6 +218,8 @@ global %1
     WRAP glColorPointer
     WRAP glDepthFunc
     WRAP glDepthMask
+    WRAP glPolygonMode
+    WRAP glPolygonOffset
     WRAP glDisable
     WRAP glDisableClientState
     WRAP glDrawArrays

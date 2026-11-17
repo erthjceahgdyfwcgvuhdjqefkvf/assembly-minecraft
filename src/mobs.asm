@@ -1,16 +1,3 @@
-; mobs.asm - pigs, cows and zombies.
-;
-; Pigs and cows spawn on grassy ground in daylight, wander, run when hit
-; and drop raw meat. Zombies spawn in the dark (night, caves) unless the
-; difficulty is Peaceful, walk at the player, hit for 1.5 hearts, burn in
-; sunlight and drop rotten flesh. Mobs are not saved: they despawn far
-; away and new ones spawn around the player.
-;
-; A mob is a box (half width, height) with gravity, collision against
-; solid nodes, a jump up one node when walking into a wall, and floating
-; in water. Models are boxes drawn with the inventory figure's code, lit by
-; the light where the mob stands.
-
 %include "common.inc"
 
 global mobs, mob_count, mob_spawn, mob_update, mob_attack, mob_clear
@@ -18,10 +5,12 @@ global draw_mobs, crop_tick, game_rand, mob_spawning, mob_feed
 global mob_pick, mob_blast, randf, mob_ray, mob_shot, draw_fireballs
 
 extern pos, vel, syaw, cyaw, pitch, dt, sunlight, game_mode, set_difficulty
+extern eff_time
+extern eye_h
 extern world_get, block_flags, light_get, light_curve, solid_at
 extern player_damage, ent_spawn, inv, sel_slot, tool_of, tool_wear
 extern cur_pcx, cur_pcz, target_hit, target, knock_x, knock_z
-extern fig_parts, fig_tint, dimension, fire_set
+extern fig_parts, fig_tint, dimension, fire_set, sound_keep_at
 extern world_find, world_set, chunk_hmap, chunk_blocks, wool_rgb
 extern glPushMatrix, glPopMatrix, glTranslatef, glRotatef, glScalef
 extern glEnable, glDisable
@@ -50,6 +39,9 @@ T_SHOVEL    equ 3
 T_SWORD     equ 4
 MAX_ANIMALS equ 8
 MAX_ZOMBIES equ 6
+NETHER_WITHERS equ 9                ; the nether: 50% more, spawning 50% faster
+ISLAND_ZOMBIES equ 20
+ISLAND_SLOW equ 5                   ; once full: new ones only every 5 s
 GL_CULL_FACE equ 0x0B44
 GL_TEXTURE_2D equ 0x0DE1
 GL_ALPHA_TEST equ 0x0BC0
@@ -143,6 +135,9 @@ f_fade:     dd 4.0                  ; knockback fades at this rate
 f_cool:     dd 1.0                  ; zombie attack interval
 f_reach:    dd 3.5                  ; player's reach for hitting
 f_sunburn:  dd 0.6
+f_ang:      dd 0.00614192           ; 2 pi / 1023
+f_distr:    dd 0.02150538           ; 22 / 1023
+f_dist0:    dd 10.0
 f_rad2deg:  dd 57.29578
 f_2pi:      dd 6.2831853
 f_inv65536: dd 0.0000152587890625
@@ -168,6 +163,7 @@ f_360:      dd 360.0
 f_pause:    dd 1.0                  ; stands this long after meeting water
 f_lavarate: dd 8.0                  ; damage a second in lava
 f_hop:      dd 7.0                  ; slimes: jump speed, wait 0.6-2.0 s
+f_groans:   dd 0.09                 ; a zombie's groans a second
 f_hopmin:   dd 0.6
 f_hopwait:  dd 1.4
 f_gwander:  dd 3.0                  ; ghasts: a new way every 3-6 s
@@ -336,6 +332,8 @@ alignb 16
 mobs:       resb MAX_MOBS * MB_SIZE
 mob_count:  resd 1
 spawn_t:    resd 1
+island_full: resd 1                 ; the island's zombies reached their cap
+island_tick: resd 1
 p_dist:     resd 1                  ; scratch: player distance of this mob
 p_dx:       resd 1
 p_dz:       resd 1
@@ -777,8 +775,57 @@ mob_drops:
 .type:
     cmp dword [rbx + MB_TYPE], MOB_WITHER
     jne .typed
-    cmp dword [rbx + MB_COLOR], 0
-    je .out                         ; not killed with an iron sword: nothing
+    ; killed by the player: a beacon core one time in a hundred
+    test dword [rbx + MB_COLOR], 2
+    jz .nocore
+    call rand
+    shr eax, 8
+    xor edx, edx
+    mov ecx, 100
+    div ecx
+    test edx, edx
+    jnz .nocore
+    movss xmm0, [rbx + MB_X]
+    movss xmm1, [rbx + MB_Y]
+    addss xmm1, [f_half]
+    movss xmm2, [rbx + MB_Z]
+    xorps xmm3, xmm3
+    movss xmm4, [f_two]
+    xorps xmm5, xmm5
+    mov edi, I_BEACONCORE | (1 << 8)
+    call ent_spawn
+.nocore:
+    ; gunpowder: a diamond sword 2-4 every time, an iron sword 2-4 half
+    ; the time, anything else 1 a third of the time
+    test dword [rbx + MB_COLOR], 2
+    jz .out                         ; not killed by the player: none
+    test dword [rbx + MB_COLOR], 4
+    jnz .many
+    test dword [rbx + MB_COLOR], 1
+    jz .other
+    call rand
+    test eax, 0x100
+    jz .out
+.many:
+    call rand
+    shr eax, 8
+    xor edx, edx
+    mov ecx, 3
+    div ecx
+    add edx, 2                      ; 2 .. 4
+    jmp .gunpowder
+.other:
+    call rand
+    shr eax, 8
+    xor edx, edx
+    mov ecx, 3
+    div ecx
+    test edx, edx
+    jnz .out
+    mov edx, 1
+.gunpowder:
+    mov r12d, I_GUNPOWDER
+    jmp .count
 .typed:
     TYPEREC
     movzx r12d, byte [rax + TY_DROP]
@@ -1358,7 +1405,7 @@ mob_ray_go:
     movss xmm0, [pos]
     movss [rsp + 20], xmm0
     movss xmm0, [pos + 4]
-    addss xmm0, [f_eye]
+    addss xmm0, [eye_h]
     movss [rsp + 24], xmm0
     movss xmm0, [pos + 8]
     movss [rsp + 28], xmm0
@@ -1600,6 +1647,15 @@ mob_think:
     cmp eax, MOB_WITHER
     jne .animal
 .hostile:
+    ; a groan now and then
+    call randf
+    movss xmm1, [dt]
+    mulss xmm1, [f_groans]
+    comiss xmm0, xmm1
+    jae .quiet
+    mov rdi, rbx
+    call mob_voice
+.quiet:
     ; just hit: stagger back instead of walking on
     movss xmm0, [rbx + MB_HURT]
     comiss xmm0, [f_zero]
@@ -1712,6 +1768,8 @@ mob_think:
     mov eax, [f_hop]
     mov [rbx + MB_VY], eax
     mov dword [rbx + MB_GROUND], 0
+    mov rdi, rbx
+    call mob_voice
     jmp .move_direct
 
 .ghast:
@@ -1833,9 +1891,11 @@ mob_think:
     mov dword [rbx + MB_HASTGT], 0
 .move_direct:
     call mob_physics
-    ; zombies burn under the open sky by day
+    ; zombies burn under the open sky by day (not on the dragon's island)
     cmp dword [rbx + MB_TYPE], MOB_ZOMBIE
     jne .alive
+    cmp dword [dimension], 2
+    je .alive
     movss xmm0, [sunlight]
     comiss xmm0, [f_sunburn]
     jbe .alive
@@ -2011,6 +2071,74 @@ spawn_try:
 .out:
     LEAVE_FN
 
+; island_spawn - a zombie on the island's ground 10 to 32 nodes from the
+; player (any light)
+island_spawn:
+    ENTER_FN 16
+    call rand
+    shr eax, 8
+    and eax, 1023
+    cvtsi2ss xmm0, eax
+    mulss xmm0, [f_ang]             ; an angle
+    movss [rsp], xmm0
+    call rand
+    shr eax, 8
+    and eax, 1023
+    cvtsi2ss xmm0, eax
+    mulss xmm0, [f_distr]
+    addss xmm0, [f_dist0]           ; 10 .. 32
+    movss [rsp + 4], xmm0
+    fld dword [rsp]
+    fsincos
+    fstp dword [rsp + 8]            ; cos
+    fstp dword [rsp + 12]           ; sin
+    movss xmm0, [rsp + 8]
+    mulss xmm0, [rsp + 4]
+    addss xmm0, [pos]
+    cvttss2si r12d, xmm0
+    movss xmm0, [rsp + 12]
+    mulss xmm0, [rsp + 4]
+    addss xmm0, [pos + 8]
+    cvttss2si r13d, xmm0
+    ; down from above the island to its ground
+    mov r14d, END_TOP + 6
+.down:
+    mov edi, r12d
+    mov esi, r14d
+    mov edx, r13d
+    call world_get
+    cmp eax, B_GRASS
+    je .ground
+    cmp eax, B_DIRT
+    je .ground
+    dec r14d
+    cmp r14d, END_TOP - 8
+    jg .down
+    jmp .out
+.ground:
+    mov edi, r12d
+    lea esi, [r14 + 1]
+    mov edx, r13d
+    call world_get
+    test eax, eax
+    jnz .out
+    mov edi, r12d
+    lea esi, [r14 + 2]
+    mov edx, r13d
+    call world_get
+    test eax, eax
+    jnz .out
+    mov edi, MOB_ZOMBIE
+    cvtsi2ss xmm0, r12d
+    addss xmm0, [f_half]
+    lea eax, [r14 + 1]
+    cvtsi2ss xmm1, eax
+    cvtsi2ss xmm2, r13d
+    addss xmm2, [f_half]
+    call mob_spawn
+.out:
+    LEAVE_FN
+
 ; void mob_update(void) - spawn, move, fight, despawn
 mob_update:
     ENTER_FN 16
@@ -2044,6 +2172,8 @@ mob_update:
     inc ecx
     jmp .cnt
 .counted:
+    cmp dword [dimension], 2        ; (no animals on the dragon's island)
+    je .hostile
     cmp r12d, MAX_ANIMALS
     jae .hostile
     xor edi, edi
@@ -2053,11 +2183,53 @@ mob_update:
 .hostile:
     cmp dword [set_difficulty], 0
     je .mobs
-    cmp r13d, MAX_ZOMBIES
+    cmp dword [dimension], 2
+    jne .usual
+    ; the dragon's island crawls with zombies, up to 20; once there were
+    ; that many, the dead are replaced slowly
+    cmp r13d, ISLAND_ZOMBIES
+    jb .room
+    mov dword [island_full], 1
+    jmp .mobs
+.room:
+    cmp dword [island_full], 0
+    je .fast
+    inc dword [island_tick]
+    cmp dword [island_tick], ISLAND_SLOW
+    jb .mobs
+    mov dword [island_tick], 0
+    call island_spawn
+    inc r13d
+    cmp r13d, ISLAND_ZOMBIES
+    jae .mobs
+    call island_spawn
+    jmp .mobs
+.fast:
+    mov r12d, 3                     ; up to 3 at a time, never over 20
+.f3:
+    call island_spawn
+    inc r13d
+    cmp r13d, ISLAND_ZOMBIES
+    jae .mobs
+    dec r12d
+    jnz .f3
+    jmp .mobs
+.usual:
+    mov dword [island_full], 0      ; (back on the island it fills again)
+    mov eax, MAX_ZOMBIES
+    cmp dword [dimension], 1
+    jne .cap
+    mov eax, NETHER_WITHERS
+.cap:
+    cmp r13d, eax
     jae .mobs
     mov edi, 1
     call spawn_try
     mov edi, 1
+    call spawn_try
+    cmp dword [dimension], 1
+    jne .mobs
+    mov edi, 1                      ; wither skeletons: a third try
     call spawn_try
 .mobs:
     xor r12d, r12d
@@ -2200,15 +2372,20 @@ mob_attack:
     movzx edi, byte [rcx + rax*4]
     call tool_of                    ; ecx kind, eax tier
     mov r13d, ecx
-    ; a wither skeleton remembers if this hit was an iron or diamond sword
+    ; a wither skeleton remembers if this hit was an iron (1) or diamond
+    ; (1 + 4) sword
     xor edx, edx
     cmp ecx, T_SWORD
     jne .ws
     cmp eax, 3
     setae dl
+    cmp eax, 4
+    jb .ws
+    or edx, 4
 .ws:
     cmp dword [rbx + MB_TYPE], MOB_WITHER
     jne .notw
+    or edx, 2                       ; (and that the player hit it)
     mov [rbx + MB_COLOR], edx
 .notw:
     mov edx, 1
@@ -2228,7 +2405,20 @@ mob_attack:
     jne .d4
     mov edx, eax
 .d4:
+    ; a beacon's strength: 40% more
+    movss xmm0, [eff_time + 4]
+    comiss xmm0, [f_zero]
+    jbe .nostr
+    imul eax, edx, 14
+    add eax, 5
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    mov edx, eax
+.nostr:
     sub [rbx + MB_HP], edx
+    mov rdi, rbx
+    call mob_cry
     mov eax, [f_hurtt]
     mov [rbx + MB_HURT], eax
     ; knocked back along the view, a little up; animals run
@@ -2304,8 +2494,8 @@ draw_mobs:
     cvttss2si eax, xmm0
     cmp eax, ecx
     cmovl eax, ecx
-    cmp dword [dimension], 0
-    je .bright
+    cmp dword [dimension], 1
+    jne .bright
     lea rdx, [light_curve]
     movzx ecx, byte [rdx + NETHER_LIGHT]
     cmp eax, ecx
@@ -2845,6 +3035,7 @@ fireball_spawn:
     movss [rax + FB_VX + 4], xmm4
     movss [rax + FB_VX + 8], xmm5
     mov dword [rax + FB_AGE], 0
+    SFX_AT S_WHOOSH, 160, 100
     ret
 
 ; fireball_update - fly; hitting a block or a mob (or a player in
@@ -2965,6 +3156,7 @@ fireball_burst:
     movss [rsp], xmm0
     movss [rsp + 4], xmm1
     movss [rsp + 8], xmm2
+    SFX_AT S_EXPLODE, 90, 170
     xor r14d, r14d
 .m:
     cmp r14d, [mob_count]
@@ -3072,13 +3264,15 @@ mob_shot:
     lea rax, [mobs]
     add rax, rdi
     sub [rax + MB_HP], esi
+    mov rdi, rax
+    call mob_cry
     mov ecx, [f_hurtt]
     mov [rax + MB_HURT], ecx
     mov ecx, [f_fleet]
     mov [rax + MB_FLEE], ecx
     cmp dword [rax + MB_TYPE], MOB_WITHER
     jne .push
-    mov dword [rax + MB_COLOR], 0   ; (no gunpowder for bullets)
+    mov dword [rax + MB_COLOR], 2   ; (shot by the player: no gunpowder)
 .push:
     cmp dword [rax + MB_TYPE], MOB_GHAST
     je .out                         ; too big to push
@@ -3091,6 +3285,79 @@ mob_shot:
     addss xmm0, [rax + MB_KZ]
     movss [rax + MB_KZ], xmm0
 .out:
+    ret
+
+; mob_cry - the mob at rdi was hit: a thud and its voice, from where it
+; is. mob_voice - only the voice (a zombie's groan, a slime's hop). Every
+; register is kept.
+mob_cry:
+    sub rsp, 56
+    movups [rsp], xmm0
+    movups [rsp + 16], xmm1
+    movups [rsp + 32], xmm2
+    movss xmm0, [rdi + MB_X]
+    movss xmm1, [rdi + MB_Y]
+    movss xmm2, [rdi + MB_Z]
+    SFX_AT S_HIT, 90, 100
+    jmp mob_voice.type
+mob_voice:
+    sub rsp, 56
+    movups [rsp], xmm0
+    movups [rsp + 16], xmm1
+    movups [rsp + 32], xmm2
+    movss xmm0, [rdi + MB_X]
+    movss xmm1, [rdi + MB_Y]
+    movss xmm2, [rdi + MB_Z]
+.type:
+    push rax
+    pushfq
+    mov eax, [rdi + MB_TYPE]
+    cmp eax, MOB_PIG
+    jne .v2
+    SFX_AT S_SQUEAK, 90, 100
+.v2:
+    cmp eax, MOB_COW
+    jne .v3
+    SFX_AT S_SQUEAK, 100, 55
+.v3:
+    cmp eax, MOB_SHEEP
+    jne .v4
+    SFX_AT S_SQUEAK, 90, 78
+.v4:
+    cmp eax, MOB_ZOMBIE
+    jne .v5
+    SFX_AT S_GROAN, 110, 115
+.v5:
+    cmp eax, MOB_WITHER
+    jne .v6
+    SFX_AT S_GROAN, 110, 85
+.v6:
+    cmp eax, MOB_GIANT
+    jne .v7
+    SFX_AT S_GROAN, 180, 55
+.v7:
+    cmp eax, MOB_SLIME_L
+    jne .v8
+    SFX_AT S_BLOP, 100, 62
+.v8:
+    cmp eax, MOB_SLIME_M
+    jne .v9
+    SFX_AT S_BLOP, 75, 100
+.v9:
+    cmp eax, MOB_SLIME_S
+    jne .v10
+    SFX_AT S_BLOP, 55, 150
+.v10:
+    cmp eax, MOB_GHAST
+    jne .v11
+    SFX_AT S_SQUEAK, 160, 40
+.v11:
+    popfq
+    pop rax
+    movups xmm0, [rsp]
+    movups xmm1, [rsp + 16]
+    movups xmm2, [rsp + 32]
+    add rsp, 56
     ret
 
 ; void draw_fireballs(void) - spinning balls of fire, full bright

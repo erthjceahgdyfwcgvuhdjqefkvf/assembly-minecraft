@@ -1,13 +1,3 @@
-; texgen.asm - procedural RGBA texture atlas.
-;
-; No image files or decoders: every tile is a base colour plus hashed
-; per-pixel variation and a small pattern (stripes, rings, bricks...).
-; Tiles are drawn at 16x16, reduced to the chosen resolution (16, 8, 4 or
-; 1 = flat colour), then repeated 8 x 8 so a merged quad of up to 8 nodes
-; tiles correctly. Layout: 16 tiles per row, 4 rows, each tile res*8
-; pixels square, so the atlas is (res*128) x (res*32) - 2048 x 512 at most.
-; Item icons (tools, ingots...) live in a separate 256x32 texture.
-
 %include "common.inc"
 
 global texgen_atlas, atlas_rgba, atlas_w, atlas_h, block_tiles
@@ -41,7 +31,17 @@ P_TNT     equ 21                    ; byte 9: 0 side (white band), 1 top (fuse),
 P_FLAME   equ 22                    ; tongues of fire, colour 2 (yellow) at the bottom
 P_SGLASS  equ 23                    ; stained glass: see-through tint, solid rim
 P_BEACON  equ 24                    ; glass shell (colour 2) round a bright core
-NUM_TILES equ 122
+P_METAL   equ 25                    ; blocks of iron / gold / diamond / coal: style in byte 9
+P_STICKS  equ 26                    ; three posts side by side: an unlit bluestone
+                                    ; torch, a lit one and a lever handle
+P_LAMP    equ 27                    ; a lamp: panes in a frame
+P_SLAB    equ 28                    ; repeater / comparator top: byte 9 the marks
+P_RAIL    equ 29                    ; byte 9: 0 straight, 1 corner, 2 powered, 3 powered on
+P_DOOR    equ 30                    ; byte 9: 0 door bottom, 1 door top (window),
+                                    ; 2 trapdoor; + 4 iron
+P_BIRCH   equ 31                    ; pale bark with dark dashes (colour 2)
+P_CHEST   equ 32                    ; byte 9: 0 front (latch), 1 side, 2 top
+NUM_TILES equ 157
 
 
 %macro TILE 6-11 0, 0, 0, 0, 0
@@ -91,10 +91,10 @@ tiles:
     TILE 140, 140, 140, 20, P_SMOOTH,   255                  ; 38 furnace top
     TILE 110,  80,  40, 10, P_TORCH,    255, 255, 220,  80   ; 39 torch
     TILE 158, 164, 178, 14, P_NOISE,    255                  ; 40 clay
-    TILE 216, 216, 216, 14, P_SMOOTH,   255                  ; 41 block of iron
-    TILE 245, 205,  60, 18, P_SMOOTH,   255                  ; 42 block of gold
-    TILE 100, 225, 215, 18, P_SMOOTH,   255                  ; 43 block of diamond
-    TILE  34,  34,  36, 14, P_SMOOTH,   255                  ; 44 block of coal
+    TILE 216, 216, 216,  8, P_METAL,    255, 0, 0, 0, 1     ; 41 block of iron
+    TILE 245, 205,  60,  8, P_METAL,    255, 0, 0, 0, 2     ; 42 block of gold
+    TILE 100, 225, 215,  8, P_METAL,    255, 0, 0, 0, 3     ; 43 block of diamond
+    TILE  64,  64,  68,  8, P_METAL,    255, 0, 0, 0, 4     ; 44 block of coal
     TILE 104,  72,  46, 30, P_FARMLAND, 255                  ; 45 farmland top
     TILE  86, 156,  62, 40, P_PLANT,    255,   0,   0,   0, 13, 0   ; 46 tall grass
     TILE  76, 160,  56, 30, P_PLANT,    255,   0,   0,   0,  2, 0   ; 47-54 wheat
@@ -172,6 +172,41 @@ tiles:
     TILE 161,  39,  34,  6, P_SGLASS,   140                  ; 119 red stained glass
     TILE  20,  21,  25,  6, P_SGLASS,   140                  ; 120 black stained glass
     TILE 110, 236, 226, 10, P_BEACON,   255, 236, 250, 248   ; 121 beacon
+    TILE 166,  40,  40, 16, P_TOPSTRIP, 255, 236, 236, 232, 1  ; 122 bed head, pillow at the far edge
+    TILE 166,  40,  40, 16, P_TOPSTRIP, 255, 236, 236, 232, 2  ; 123 pillow at the left edge
+    TILE 166,  40,  40, 16, P_TOPSTRIP, 255, 236, 236, 232, 3  ; 124 pillow at the right edge
+    TILE  44,  56,  92, 30, P_NOISE,    255                  ; 125 bluestone, dark
+    TILE  96, 204, 255, 20, P_NOISE,    255                  ; 126 bluestone, lit
+    TILE 110,  80,  40, 10, P_STICKS,   255, 120, 226, 255   ; 127 torch and lever posts
+    TILE  44, 104, 224,  8, P_METAL,    255, 0, 0, 0, 2      ; 128 block of bluestone
+    TILE  92,  74,  56, 20, P_LAMP,     255                  ; 129 lamp
+    TILE 170, 226, 255, 10, P_LAMP,     255                  ; 130 lamp, lit
+    TILE 118, 118, 124, 24, P_SMOOTH,   255                  ; 131 piston body
+    TILE 200, 160, 104, 20, P_PLANKS,   255                  ; 132 piston face
+    TILE 112, 190,  92, 20, P_SMOOTH,   255                  ; 133 sticky piston face
+    TILE 176, 176, 176, 12, P_SLAB,     255,  40,  70, 150, 0  ; 134 repeater top
+    TILE 176, 176, 176, 12, P_SLAB,     255,  40,  70, 150, 1  ; 135 comparator top
+    TILE 190, 190, 196, 12, P_RAIL,     255, 120,  86,  50, 0  ; 136 rail
+    TILE 190, 190, 196, 12, P_RAIL,     255, 120,  86,  50, 1  ; 137 rail corner
+    TILE 232, 190,  60, 12, P_RAIL,     255,  40,  60, 120, 2  ; 138 powered rail
+    TILE 232, 190,  60, 12, P_RAIL,     255, 110, 220, 255, 3  ; 139 powered rail, on
+    TILE 128, 128, 128, 40, P_ORE,      255,  60, 120, 255   ; 140 bluestone ore
+    TILE 164, 120,  72, 14, P_DOOR,     255, 190, 222, 236, 0  ; 141 wooden door, bottom
+    TILE 164, 120,  72, 14, P_DOOR,     255, 190, 222, 236, 1  ; 142 wooden door, top
+    TILE 204, 204, 208,  8, P_DOOR,     255, 190, 222, 236, 4  ; 143 iron door, bottom
+    TILE 204, 204, 208,  8, P_DOOR,     255, 190, 222, 236, 5  ; 144 iron door, top
+    TILE 164, 120,  72, 14, P_DOOR,     255,  50,  36,  24, 2  ; 145 trapdoor
+    TILE 204, 204, 208,  8, P_DOOR,     255,  60,  60,  64, 6  ; 146 iron trapdoor
+    TILE 216, 214, 204, 10, P_BIRCH,    255,  44,  40,  36   ; 147 birch log side
+    TILE 206, 186, 136, 20, P_RINGS,    255, 216, 214, 204   ; 148 birch log top
+    TILE  64,  46,  28, 30, P_VSTRIPE,  255                  ; 149 dark oak log side
+    TILE 118,  86,  52, 20, P_RINGS,    255,  64,  46,  28   ; 150 dark oak log top
+    TILE 214, 194, 138, 16, P_PLANKS,   255                  ; 151 birch planks
+    TILE  92,  62,  36, 20, P_PLANKS,   255                  ; 152 dark oak planks
+    TILE 168, 120,  60, 14, P_CHEST,    255,  70,  70,  76, 0  ; 153 chest front
+    TILE 168, 120,  60, 14, P_CHEST,    255,  70,  70,  76, 1  ; 154 chest side
+    TILE 168, 120,  60, 14, P_CHEST,    255,  70,  70,  76, 2  ; 155 chest top
+    TILE  86, 170,  64, 40, P_ORE,      200, 150, 104,  80   ; 156 green portal (rotten flesh)
 
 ; "TNT" on the side band, rows 6-9: bit x = column x
 tnt_glyph:  dw 0x3A5C, 0x12C8, 0x1348, 0x1248
@@ -244,7 +279,7 @@ block_tiles:
     db 91, 91, 91, 0        ; yellow flower
     db 92, 92, 92, 0        ; red flower
     db 93, 93, 93, 0        ; bed, foot
-    db 94, 94, 94, 0        ; bed, head
+    db 94, 93, 93, 0        ; bed, head
     db 95, 95, 95, 0        ; dye maker
     times 4 db 96, 96, 96, 0  ; lava, still and flowing
     db 97, 97, 97, 0        ; obsidian
@@ -259,7 +294,32 @@ block_tiles:
 %assign c c + 1
 %endrep
     db 121, 121, 121, 0     ; beacon
-    times (256 - NUM_BLOCKS) * 4 db 0
+    db 39, 39, 39, 0        ; torch on a wall
+    db 140, 140, 140, 0     ; bluestone ore
+    db 128, 128, 128, 0     ; block of bluestone
+    ; the bluestone parts (wiremesh.inc draws them; these are the tiles
+    ; their bits fly off with, and the lamp's faces)
+    db 125, 125, 125, 0
+    times 15 db 126, 126, 126, 0      ; dust
+    times 10 db 127, 127, 127, 0      ; torch
+    times 10 db 15, 15, 15, 0         ; lever
+    times 10 db 0, 0, 0, 0            ; button, pressure plate
+    times 8 db 134, 134, 134, 0       ; repeater
+    times 8 db 135, 135, 135, 0       ; comparator
+    db 129, 129, 129, 0               ; lamp
+    db 130, 130, 130, 0
+    times 24 db 131, 131, 131, 0      ; pistons
+    times 6 db 132, 132, 132, 0       ; piston head
+    times 10 db 136, 136, 136, 0      ; rail
+    times 12 db 138, 138, 138, 0      ; powered rail
+    times 4 db 141, 141, 141, 0       ; door
+    times 2 db 145, 145, 145, 0       ; trapdoor
+    db 148, 147, 148, 0               ; birch log
+    db 150, 149, 150, 0               ; dark oak log
+    db 151, 151, 151, 0               ; birch planks
+    db 152, 152, 152, 0               ; dark oak planks
+    db 16, 16, 16, 0                  ; slab, stairs, chest (drawn by wiremesh)
+    times (256 - W_SHAPE - 1) * 4 db 0
 
 %include "items_data.inc"
 
@@ -308,7 +368,7 @@ texgen_atlas:
     shl eax, 7
     mov [atlas_w], eax
     mov eax, edi
-    shl eax, 6                      ; 8 rows of tiles
+    shl eax, 7                      ; 16 rows of tiles
     mov [atlas_h], eax
     xor r12d, r12d
 .tile:
@@ -364,6 +424,8 @@ texgen_atlas:
     je .torch
     cmp ecx, P_SMOOTH
     je .smooth
+    cmp ecx, P_METAL
+    je .metal
     cmp ecx, P_FARMLAND
     je .farmland
     cmp ecx, P_PLANT
@@ -380,6 +442,20 @@ texgen_atlas:
     je .sglass
     cmp ecx, P_BEACON
     je .beacon
+    cmp ecx, P_STICKS
+    je .sticks
+    cmp ecx, P_LAMP
+    je .lamp
+    cmp ecx, P_SLAB
+    je .slab
+    cmp ecx, P_RAIL
+    je .rail
+    cmp ecx, P_DOOR
+    je .door
+    cmp ecx, P_BIRCH
+    je .birch
+    cmp ecx, P_CHEST
+    je .chest
     jmp .write
 
 ; RECT x0, x1, y0, y1, target - jump if px in [x0,x1] and py in [y0,y1]
@@ -664,6 +740,98 @@ texgen_atlas:
     mov ebx, 170
     jmp .write
 
+.metal:
+    ; polished blocks: a bevel (light top/left, dark bottom/right) and a
+    ; surface that differs by style: 1 iron plates, 2 gold and 3 diamond
+    ; with diagonal glints, 4 coal with raised, ragged lumps
+    movzx eax, byte [r13 + 9]
+    cmp eax, 1
+    je .mt_iron
+    cmp eax, 4
+    je .mt_coal
+    mov edx, r15d
+    add edx, r14d                   ; gold: streaks along x + y
+    cmp eax, 3
+    jne .mt_streak
+    mov edx, r15d                   ; diamond: along x - y, wider
+    sub edx, r14d
+    and edx, 15
+    cmp edx, 3
+    jae .mt_ring
+    add ebx, 34
+    jmp .mt_ring
+.mt_streak:
+    and edx, 15
+    cmp edx, 3
+    je .mt_gl
+    cmp edx, 4
+    jne .mt_g2
+.mt_gl:
+    add ebx, 34
+    jmp .mt_ring
+.mt_g2:
+    cmp edx, 10
+    jne .mt_ring
+    add ebx, 18
+    jmp .mt_ring
+.mt_iron:
+    mov eax, r14d
+    and eax, 3
+    jnz .mt_i1
+    add ebx, 30                     ; the lit edge of a plate
+    jmp .mt_ring
+.mt_i1:
+    cmp eax, 3
+    jne .mt_ring
+    sub ebx, 44                     ; the shaded edge under it
+    cmp r15d, 7
+    jne .mt_ring
+    jmp .mt_ring
+.mt_coal:
+    mov edi, r15d
+    shr edi, 1
+    mov esi, r14d
+    shr esi, 1
+    mov edx, 61
+    call phash
+    and eax, 7
+    cmp eax, 3
+    jae .mt_pit
+    mov eax, r14d                   ; a raised lump: lit on its top-left
+    or eax, r15d
+    test eax, 1
+    jnz .mt_lump2
+    add ebx, 70
+    jmp .mt_ring
+.mt_lump2:
+    add ebx, 12
+    jmp .mt_ring
+.mt_pit:
+    sub ebx, 30
+.mt_ring:
+    cmp r14d, 0
+    je .mt_lit
+    cmp r15d, 0
+    je .mt_lit
+    cmp r14d, 15
+    je .mt_dark
+    cmp r15d, 15
+    je .mt_dark
+    cmp r14d, 1                     ; an inner line one in from the edge
+    je .mt_in
+    cmp r15d, 1
+    je .mt_in
+    jmp .write
+.mt_in:
+    add ebx, 10
+    jmp .write
+.mt_lit:
+    add ebx, 36
+    jmp .write
+.mt_dark:
+    sub ebx, 52
+    jmp .write
+
 .crack:
     ; blotches that spread with the stage
     mov edi, r15d
@@ -690,13 +858,26 @@ texgen_atlas:
     jmp .write
 
 .topstrip:
-    mov edi, r15d
+    ; byte 9: which edge the strip lies along (0 top, 1 bottom, 2 left, 3 right)
+    movzx edx, byte [r13 + 9]
+    mov edi, r15d                   ; along the strip
+    mov esi, r14d                   ; across it
+    cmp edx, 2
+    jb .ts_h
+    xchg edi, esi
+.ts_h:
+    test edx, 1
+    jz .ts_n
+    neg esi
+    add esi, 15
+.ts_n:
+    mov r8d, esi
     mov esi, 99
     mov edx, r12d
     call phash
     and eax, 1
     add eax, 3
-    cmp r14d, eax
+    cmp r8d, eax
     jae .write
     mov dword [rsp], 1
     jmp .write
@@ -828,6 +1009,267 @@ texgen_atlas:
 .b_mortar:
     mov dword [rsp], 1
     jmp .write
+
+.sticks:
+    ; posts two texels wide from row 6 down: columns 2-3 a torch that is
+    ; out, 8-9 one that is lit, 12-13 (from row 4) a lever handle
+    mov dword [rsp + 4], 0
+    INRECT 2, 3, 6, 7, .st_dead
+    INRECT 8, 9, 6, 7, .st_lit
+    INRECT 12, 13, 4, 5, .st_knob
+    INRECT 2, 3, 8, 15, .st_wood
+    INRECT 8, 9, 8, 15, .st_wood
+    INRECT 12, 13, 6, 15, .st_wood
+    jmp .write
+.st_dead:
+    mov dword [rsp], 1
+    mov ebx, 70
+    jmp .st_wood
+.st_lit:
+    mov dword [rsp], 1
+    mov ebx, 256
+    jmp .st_wood
+.st_knob:
+    mov ebx, 420
+.st_wood:
+    mov dword [rsp + 4], 255
+    jmp .write
+
+.lamp:
+    ; four panes in a dark frame
+    INRECT 0, 15, 0, 0, .lm_frame
+    INRECT 0, 15, 15, 15, .lm_frame
+    INRECT 0, 0, 0, 15, .lm_frame
+    INRECT 15, 15, 0, 15, .lm_frame
+    INRECT 7, 8, 0, 15, .lm_bar
+    INRECT 0, 15, 7, 8, .lm_bar
+    mov eax, r15d
+    add eax, r14d
+    test eax, 7
+    jnz .write
+    imul ebx, ebx, 290              ; a glint across each pane
+    shr ebx, 8
+    jmp .write
+.lm_frame:
+    mov ebx, 110
+    jmp .write
+.lm_bar:
+    mov ebx, 160
+    jmp .write
+
+.slab:
+    ; pale stone with a dark rim; marks in colour 2 pointing toward +u:
+    ; a line with an arrow head (repeater) or three pads (comparator)
+    INRECT 0, 15, 0, 0, .sm_rim
+    INRECT 0, 15, 15, 15, .sm_rim
+    INRECT 0, 0, 0, 15, .sm_rim
+    INRECT 15, 15, 0, 15, .sm_rim
+    cmp byte [r13 + 9], 0
+    jne .sl_comp
+    INRECT 3, 10, 7, 8, .sl_mark
+    cmp r15d, 10
+    jb .write
+    cmp r15d, 13
+    ja .write
+    lea eax, [r14*2 - 15]
+    imul eax, eax                   ; (2 py - 15)^2
+    mov ecx, 13
+    sub ecx, r15d
+    lea ecx, [rcx*2 + 1]
+    imul ecx, ecx
+    cmp eax, ecx
+    ja .write
+.sl_mark:
+    mov dword [rsp], 1
+    mov ebx, 256
+    jmp .write
+.sl_comp:
+    INRECT 2, 4, 3, 5, .sl_mark
+    INRECT 2, 4, 10, 12, .sl_mark
+    INRECT 11, 13, 7, 8, .sl_mark
+    INRECT 5, 10, 7, 8, .sl_mark
+    jmp .write
+
+.birch:
+    ; dark dashes across pale bark, 4 texels long
+    mov edi, r15d
+    shr edi, 2
+    mov esi, r14d
+    mov edx, 91
+    call phash
+    and eax, 15
+    cmp eax, 2
+    ja .write
+    mov dword [rsp], 1
+    jmp .write
+
+.chest:
+    ; boards in a dark frame; the sides show the lid's edge, the front
+    ; its metal latch (colour 2)
+    INRECT 0, 15, 0, 0, .ch_rim
+    INRECT 0, 15, 15, 15, .ch_rim
+    INRECT 0, 0, 0, 15, .ch_rim
+    INRECT 15, 15, 0, 15, .ch_rim
+    movzx eax, byte [r13 + 9]
+    cmp eax, 2
+    je .ch_board
+    test eax, eax
+    jnz .ch_lid
+    INRECT 7, 8, 4, 7, .ch_latch
+.ch_lid:
+    INRECT 1, 14, 5, 5, .ch_rim
+.ch_board:
+    mov eax, r14d
+    and eax, 3
+    cmp eax, 3
+    jne .write
+    imul ebx, ebx, 215
+    shr ebx, 8
+    jmp .write
+.ch_rim:
+    mov ebx, 140
+    jmp .write
+.ch_latch:
+    mov dword [rsp], 1
+    mov ebx, 256
+    jmp .write
+
+.door:
+    ; a frame; wood: boards and two sunk panels, iron: plates and rivets.
+    ; The top has a window (colour 2), the trapdoor four holes (colour 2).
+    INRECT 0, 15, 0, 0, .dr_rim
+    INRECT 0, 15, 15, 15, .dr_rim
+    INRECT 0, 0, 0, 15, .dr_rim
+    INRECT 15, 15, 0, 15, .dr_rim
+    movzx eax, byte [r13 + 9]
+    mov ecx, eax
+    and ecx, 3
+    cmp ecx, 1
+    je .dr_top
+    cmp ecx, 2
+    je .dr_trap
+    INRECT 12, 13, 1, 2, .dr_knob         ; the handle, near the top
+    INRECT 3, 12, 4, 7, .dr_panel
+    INRECT 3, 12, 10, 13, .dr_panel
+    jmp .dr_grain
+.dr_top:
+    INRECT 3, 12, 3, 12, .dr_glass
+    jmp .dr_grain
+.dr_trap:
+    INRECT 3, 6, 3, 6, .dr_hole
+    INRECT 9, 12, 3, 6, .dr_hole
+    INRECT 3, 6, 9, 12, .dr_hole
+    INRECT 9, 12, 9, 12, .dr_hole
+.dr_grain:
+    test eax, 4
+    jnz .dr_iron
+    mov ecx, r15d                   ; wood: a seam every 5 texels
+    xor edx, edx
+    mov eax, ecx
+    mov ecx, 5
+    div ecx
+    cmp edx, 4
+    jne .write
+    imul ebx, ebx, 215
+    shr ebx, 8
+    jmp .write
+.dr_iron:
+    INRECT 2, 2, 2, 2, .dr_rivet
+    INRECT 13, 13, 2, 2, .dr_rivet
+    INRECT 2, 2, 13, 13, .dr_rivet
+    INRECT 13, 13, 13, 13, .dr_rivet
+    test r14d, 3
+    jnz .write
+    imul ebx, ebx, 225
+    shr ebx, 8
+    jmp .write
+.dr_rim:
+    mov ebx, 150
+    jmp .write
+.dr_panel:
+    mov ebx, 205
+    jmp .write
+.dr_knob:
+    mov ebx, 70
+    jmp .write
+.dr_rivet:
+    mov ebx, 300
+    jmp .write
+.dr_glass:
+    INRECT 7, 8, 3, 12, .dr_bar
+    INRECT 3, 12, 7, 8, .dr_bar
+.dr_hole:
+    mov dword [rsp], 1
+    mov ebx, 256
+    jmp .write
+.dr_bar:
+    mov ebx, 170
+    jmp .write
+
+.rail:
+    ; two rails on sleepers, clear between; +u is along the track. The
+    ; corner turns from the +u edge to the +v edge. Powered rails have a
+    ; strip of colour 2 down the middle.
+    mov dword [rsp + 4], 0
+    movzx eax, byte [r13 + 9]
+    cmp eax, 1
+    je .rl_corner
+    INRECT 0, 15, 3, 4, .rl_metal
+    INRECT 0, 15, 11, 12, .rl_metal
+    cmp eax, 2
+    jb .rl_ties
+    INRECT 0, 15, 7, 8, .rl_strip
+.rl_ties:
+    mov ecx, r15d
+    and ecx, 3
+    cmp ecx, 1
+    jb .write
+    cmp ecx, 2
+    ja .write
+    cmp r14d, 2
+    jb .write
+    cmp r14d, 13
+    ja .write
+.rl_tie:
+    mov dword [rsp + 4], 255
+    cmp byte [r13 + 9], 2
+    jae .rl_dtie
+    mov dword [rsp], 1
+    jmp .write
+.rl_dtie:
+    mov ebx, 110                    ; powered: dark gold sleepers
+    jmp .write
+.rl_strip:
+    mov dword [rsp], 1
+    mov ebx, 256
+.rl_metal:
+    mov dword [rsp + 4], 255
+    jmp .write
+.rl_corner:
+    mov eax, 31
+    sub eax, r15d
+    sub eax, r15d
+    imul eax, eax
+    mov ecx, 31
+    sub ecx, r14d
+    sub ecx, r14d
+    imul ecx, ecx
+    add eax, ecx                    ; 4 x the squared distance from the corner
+    cmp eax, 49
+    jb .write
+    cmp eax, 121
+    jb .rl_metal
+    cmp eax, 529
+    jb .rl_ctie
+    cmp eax, 729
+    jb .rl_metal
+    jmp .write
+.rl_ctie:
+    mov ecx, r15d
+    sub ecx, r14d
+    test ecx, 3
+    jnz .write
+    jmp .rl_tie
 
 .write:
     ; destination pixel in the 16x16 tile buffer

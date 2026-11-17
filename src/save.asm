@@ -1,20 +1,8 @@
-; save.asm - worlds on disk.
-;
-; Layout under $XDG_DATA_HOME (or ~/.local/share), which follows an
-; AppImage portable home folder:
-;   voxasm/worlds/world<N>/world.dat     player, inventory, furnaces, time
-;   voxasm/worlds/world<N>/c<cx>_<cz>.bin   chunks that were changed
-; Unchanged chunks are not stored: they regenerate from the seed. Chunk
-; files are run-length encoded ("VXC1", then count/value byte pairs).
-;
-; chunk_fill runs on the world-gen thread too, so it reads files with raw
-; system calls and only touches the buffer it is given.
-
 %include "common.inc"
 
 global save_init, cur_world, world_dir, chunk_path, chunk_fill, save_chunk
 global save_meta, load_meta, save_all, worlds_scan, world_info
-global world_create_dir, world_delete, dimension
+global world_create_dir, world_delete, dimension, fill_staged
 
 extern getenv, snprintf, mkdir, fopen, fclose, fwrite, fread
 extern opendir, readdir, closedir, unlink, rmdir, strcmp, strlen
@@ -31,11 +19,13 @@ extern open, read, close
 %endif
 extern chunk_blocks, chunk_hmap, chunk_info, mapgen_chunk, mapgen_finish
 extern nether_chunk, nether_finish, portal_link
-extern mapgen_flat, seed, game_mode, world_time, pos, yaw, pitch, hp
+extern mapgen_flat, seed, game_mode, world_time, pos, yaw, pitch, hp, wire_save
+extern cmds_ok, dragon_dead, dragon_hp, crystal_gone, dragon_won, dragon_rounds
+extern end_chunk
 extern breath, sel_slot, spawn_pos, inv, furnaces, spawn_bed, armor, boats
 
 NUM_WORLDS  equ 5
-META_SIZE   equ 2560
+META_SIZE   equ 2576
 OLD_META    equ 1752                ; before armour and boats
 RLE_MAX     equ CHUNK_VOX * 2 + 16
 NUM_INV     equ 36
@@ -62,6 +52,10 @@ M_BOATS     equ 1768                ; 16 boats x 48 bytes
 BOAT_BYTES  equ 16 * 48
 M_DIM       equ 2536                ; 1 = the player is in the nether
 M_LINK      equ 2540                ; portal_link (5 dwords)
+M_DRAGON    equ 2564                ; the island's dragon: dead, health, crystals
+                                    ; gone (bits)
+M_CMDS      equ 2560                ; commands: 1 allowed (made in creative),
+                                    ; 2 not (made in survival), 0 older save
 
 ; world_info record: exists, seed, mode, flat
 WI_SIZE     equ 16
@@ -78,6 +72,7 @@ s_wdir:     db "%s/world%d", 0
 s_meta:     db "%s/world.dat", 0
 s_chunk:    db "%s/c%d_%d.bin", 0
 s_nchunk:   db "%s/n%d_%d.bin", 0       ; nether chunks
+s_echunk:   db "%s/e%d_%d.bin", 0       ; the island's chunks
 s_file:     db "%s/%s", 0
 s_worldfile: db "world.dat", 0
 s_binext:   db ".bin", 0
@@ -93,6 +88,7 @@ world_dir:  resb 512                ; .../worlds/world<N>, "" = no saving
 path_buf:   resb 512
 meta_buf:   resb META_SIZE
 dimension:  resd 1                  ; 0 the overworld, 1 the nether
+fill_staged: resd 1                 ; 1: chunk_fill loads but does not generate (-1)
 rle_buf:    resb RLE_MAX
 cur_world:  resd 1
 world_info: resb NUM_WORLDS * WI_SIZE
@@ -206,6 +202,9 @@ chunk_path:
     cmp dword [dimension], 0
     je .ow
     lea rdx, [s_nchunk]
+    cmp dword [dimension], 1
+    je .ow
+    lea rdx, [s_echunk]
 .ow:
     lea rcx, [world_dir]
     xor eax, eax
@@ -333,14 +332,26 @@ chunk_fill:
     shl rsi, 9
     lea rcx, [chunk_hmap]
     add rsi, rcx
-    cmp dword [dimension], 0
-    jne .nfinish
+    cmp dword [dimension], 1
+    jne .ofinish                    ; (the island: like the overworld)
+    call nether_finish
+    LEAVE_FN
+.ofinish:
     call mapgen_finish
     LEAVE_FN
 .nfinish:
     call nether_finish
     LEAVE_FN
 .generate:
+    ; a new overworld chunk on a one-core computer: the caller makes it a
+    ; slice a frame (world_gen_begin)
+    cmp dword [fill_staged], 0
+    je .gen_now
+    cmp dword [dimension], 0
+    jne .gen_now
+    mov eax, -1
+    LEAVE_FN
+.gen_now:
     mov eax, [rsp]
     mov rdi, rax
     shl rdi, 16
@@ -358,6 +369,11 @@ chunk_fill:
     call mapgen_chunk
     LEAVE_FN
 .nether:
+    cmp dword [dimension], 2
+    jne .nether2
+    call end_chunk
+    LEAVE_FN
+.nether2:
     call nether_chunk
     LEAVE_FN
 
@@ -476,6 +492,22 @@ save_meta:
     mov eax, [dimension]
     mov [meta_buf + M_DIM], eax
     COPY [meta_buf + M_LINK], [portal_link], 20
+    mov eax, 2
+    cmp dword [cmds_ok], 0
+    je .cmds
+    mov eax, 1
+.cmds:
+    mov [meta_buf + M_CMDS], eax
+    mov eax, [dragon_rounds]        ; dead in bit 0, won once in bit 1,
+    shl eax, 1                      ; times brought back above
+    or eax, [dragon_won]
+    add eax, eax
+    or eax, [dragon_dead]
+    mov [meta_buf + M_DRAGON], eax
+    mov eax, [dragon_hp]
+    mov [meta_buf + M_DRAGON + 4], eax
+    mov eax, [crystal_gone]
+    mov [meta_buf + M_DRAGON + 8], eax
     lea rdi, [path_buf]
     mov esi, 512
     lea rdx, [s_meta]
@@ -583,6 +615,40 @@ load_meta:
     mov eax, [meta_buf + M_DIM]
     mov [dimension], eax
     COPY [portal_link], [meta_buf + M_LINK], 20
+    mov eax, [meta_buf + M_DRAGON]
+    mov ecx, eax
+    shr ecx, 2
+    mov [dragon_rounds], ecx
+    mov ecx, eax
+    and ecx, 1
+    mov [dragon_dead], ecx
+    shr eax, 1
+    or eax, ecx                     ; (older saves: dead means won)
+    and eax, 1
+    mov [dragon_won], eax
+    mov eax, [meta_buf + M_DRAGON + 4]
+    mov [dragon_hp], eax
+    mov eax, [meta_buf + M_DRAGON + 8]
+    mov [crystal_gone], eax
+    ; check what was read: the mode is survival or creative; commands as
+    ; the world was made (an older save: as its mode)
+    xor eax, eax
+    cmp dword [game_mode], 1
+    sete al
+    mov [game_mode], eax
+    mov ecx, [meta_buf + M_CMDS]
+    cmp ecx, 1
+    je .allowed
+    cmp ecx, 2
+    je .notallowed
+    mov [cmds_ok], eax
+    jmp .cmdsdone
+.allowed:
+    mov dword [cmds_ok], 1
+    jmp .cmdsdone
+.notallowed:
+    mov dword [cmds_ok], 0
+.cmdsdone:
     mov eax, 1
 .out:
     LEAVE_FN
@@ -630,6 +696,7 @@ save_all:
     cmp ebx, NUM_SLOTS
     jb .s
     call save_meta
+    call wire_save
     LEAVE_FN
 
 ; void world_delete(int n) - remove world n (1-5): its world.dat and chunk
@@ -670,6 +737,8 @@ world_delete:
     cmp byte [r13], 'c'
     je .chunkfile
     cmp byte [r13], 'n'             ; nether chunks too
+    je .chunkfile
+    cmp byte [r13], 'e'             ; and the island's
     jne .entry
 .chunkfile:
     mov rdi, r13

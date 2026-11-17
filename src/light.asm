@@ -1,21 +1,3 @@
-; light.asm - sunlight and block light, 0-15 per node like Minecraft.
-;
-; chunk_light holds one byte per node: low nibble = sky light, high nibble
-; = block light (torches, burning furnaces). light_chunk recomputes a whole
-; chunk:
-;   1. sky light falls straight down each column at 15 until something
-;      opaque (leaves take 1, water 2 per node), block light starts at
-;      emitters
-;   2. optionally, light from the four neighbouring chunks leaks in at the
-;      borders
-;   3. both spread by breadth-first search, losing 1 per node, through
-;      everything that is not opaque
-; Day and night are not baked in: the renderer scales sky light by the
-; daylight factor when drawing, so the sun setting costs no re-meshing.
-;
-; Thread-safe per queue: the world-gen thread and the main thread each pass
-; their own flag so they never share a BFS queue.
-
 %include "common.inc"
 
 global light_chunk, chunk_light, light_emit, light_get
@@ -40,7 +22,10 @@ light_emit:
     db 11                           ; nether portal
     times B_BEACON - B_PORTAL - 1 db 0  ; slime block, stained glass
     db 15                           ; beacon
-    times 256 - B_BEACON - 1 db 0
+    db 14                           ; torch on a wall
+    times W_LAMP - B_TORCH_WALL db 0
+    db 15                           ; bluestone lamp, lit
+    times 256 - W_LAMP - 2 db 0
 
 section .bss
 alignb 4096

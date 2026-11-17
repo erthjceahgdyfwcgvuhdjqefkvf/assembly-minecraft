@@ -1,23 +1,14 @@
-; rifle.asm - the assault rifle (creative only).
-;
-; Hold the left button to fire 10 rounds a second, as far as 64 nodes:
-; each bullet hits the first mob in the view before any block for an iron
-; sword's damage (6) and pushes it a little. The view kicks up a little
-; with every shot. Endless ammunition. In survival it does nothing.
-;
-; While it is held the first-person view shows it: a blocky right arm on
-; the grip, the left arm under the handguard, the rifle built from boxes
-; (rails, sights, curved magazine...), swaying as you walk, kicking back
-; with a muzzle flash when it fires.
-
 %include "common.inc"
 
-global rifle_fire, draw_viewmodel, rifle_kick
+global rifle_fire, draw_viewmodel, rifle_kick, view_bob, hand_swing, mag_used, reload_t
 
+extern sound_keep, sound_keep_at
+extern eye_h
 extern pos, vel, yaw, pitch, syaw, cyaw, dt, game_mode, inv, sel_slot
 extern lmb_down, on_ground, state, player_dead, win_w, win_h
 extern world_raycast, world_get, block_flags, mob_ray, mob_shot, randf, light_get, light_curve
-extern sunlight, dimension, fig_parts, fig_tint
+extern sunlight, dimension, fig_parts, fig_tint, item_shape, item_icon, set_bob
+extern flying, glColor4f, dragon_shot, hud_message
 extern glMatrixMode, glPushMatrix, glPopMatrix, glLoadIdentity, glFrustum
 extern glTranslatef, glRotatef, glScalef, glEnable, glDisable, glClear
 
@@ -151,13 +142,22 @@ vm_flash:
     FPART -2.60, 0.40, -24.50, 2.60, 1.00, -22.60, 255, 200, 80
 VM_FLASH_N equ ($ - vm_flash) / 32
 
+section .rodata
+align 4
+f_reload:   dd 2.0                  ; seconds to reload (survival)
+MAG         equ 30                  ; rounds before a reload (survival)
+s_reload:   db "RELOADING", 0
 
 section .bss
 alignb 4
 shot_cool:  resd 1
+mag_used:   resd 1                  ; rounds fired since the last reload
+reload_t:   resd 1                  ; time left reloading
 rifle_kick: resd 1                  ; 1 right after a shot, fading
 flash_t:    resd 1
 bob_t:      resd 1
+bob_amp:    resd 1                  ; 0 standing .. 1 walking
+hand_swing: resd 1                  ; 1 as a swing starts, running down to 0
 ray_out:    resd 6
 ray:        resd 3                  ; direction
 origin:     resd 3                  ; where the current cast starts
@@ -172,18 +172,38 @@ rifle_fire:
     subss xmm0, [dt]
     maxss xmm0, [f_zero]
     movss [shot_cool], xmm0
-    cmp dword [game_mode], 0
-    je .out                         ; creative only
+    ; reloading (survival): nothing fires until it is done
+    movss xmm1, [reload_t]
+    comiss xmm1, [f_zero]
+    jbe .loaded
+    subss xmm1, [dt]
+    movss [reload_t], xmm1
+    comiss xmm1, [f_zero]
+    ja .out
+    mov dword [reload_t], 0
+    mov dword [mag_used], 0
+.loaded:
     cmp dword [lmb_down], 0
     je .out
     comiss xmm0, [f_zero]
     ja .out
     mov eax, [f_rate]
     mov [shot_cool], eax
+    cmp dword [game_mode], 0
+    jne .fire                       ; (creative never reloads)
+    inc dword [mag_used]
+    cmp dword [mag_used], MAG
+    jb .fire
+    mov eax, [f_reload]             ; the last round: reload after it
+    mov [reload_t], eax
+    lea rdi, [s_reload]
+    call hud_message
+.fire:
     mov eax, [f_one]
     mov [rifle_kick], eax
     mov eax, [f_flash]
     mov [flash_t], eax
+    SFX S_SHOT, 75, 100
     ; how far the first solid block is along the view (through fire,
     ; plants, torches)
     fld dword [pitch]
@@ -204,7 +224,7 @@ rifle_fire:
     mov eax, [pos]
     mov [origin], eax
     movss xmm0, [pos + 4]
-    addss xmm0, [f_eye]
+    addss xmm0, [eye_h]
     movss [origin + 4], xmm0
     mov eax, [pos + 8]
     mov [origin + 8], eax
@@ -276,7 +296,12 @@ rifle_fire:
 .clear:
     movss xmm0, [f_range]
 .far:
-    ; the first mob before it takes the round
+    ; a crystal or the dragon on the island, else the first mob before it
+    movss [rsp + 8], xmm0
+    call dragon_shot
+    test eax, eax
+    jnz .recoil
+    movss xmm0, [rsp + 8]
     call mob_ray
     test eax, eax
     js .recoil
@@ -315,34 +340,21 @@ draw_viewmodel:
     jne .out
     mov eax, [sel_slot]
     lea rcx, [inv]
-    cmp byte [rcx + rax*4], I_RIFLE
-    jne .out
-    ; sway while walking
-    movss xmm0, [vel]
-    mulss xmm0, xmm0
-    movss xmm1, [vel + 8]
-    mulss xmm1, xmm1
-    addss xmm0, xmm1
-    comiss xmm0, [f_moving]
-    jbe .still
-    cmp dword [on_ground], 0
-    je .still
-    sqrtss xmm0, xmm0
-    mulss xmm0, [f_bobrate]
-    mulss xmm0, [dt]
-    addss xmm0, [bob_t]
-    movss [bob_t], xmm0
-.still:
+    movzx eax, byte [rcx + rax*4]
+    mov [rsp + 16], eax             ; what is held (0: nothing)
+    ; sway while walking (view_bob keeps the step going)
     fld dword [bob_t]
     fsincos
     fstp dword [rsp + 12]           ; cos
     fstp dword [rsp + 8]            ; sin
     movss xmm0, [rsp + 8]
     mulss xmm0, [f_bobamp]
+    mulss xmm0, [bob_amp]
     movss [rsp + 8], xmm0
     movss xmm0, [rsp + 12]
     andps xmm0, [rel absmask]
     mulss xmm0, [f_bobamp]
+    mulss xmm0, [bob_amp]
     xorps xmm1, xmm1
     subss xmm1, xmm0
     movss [rsp + 12], xmm1
@@ -350,7 +362,7 @@ draw_viewmodel:
     movss xmm0, [pos]
     cvttss2si edi, xmm0
     movss xmm0, [pos + 4]
-    addss xmm0, [f_eye]
+    addss xmm0, [eye_h]
     cvttss2si esi, xmm0
     movss xmm0, [pos + 8]
     cvttss2si edx, xmm0
@@ -366,8 +378,8 @@ draw_viewmodel:
     cvttss2si eax, xmm0
     cmp eax, ecx
     cmovl eax, ecx
-    cmp dword [dimension], 0
-    je .lit
+    cmp dword [dimension], 1
+    jne .lit
     movzx ecx, byte [rdx + NETHER_LIGHT]
     cmp eax, ecx
     cmovl eax, ecx
@@ -415,6 +427,8 @@ draw_viewmodel:
     call glDisable PLT
     mov edi, GL_DEPTH_TEST
     call glEnable PLT
+    cmp dword [rsp + 16], I_RIFLE
+    jne .hand
     ; place it: right of centre, low, pointing a little in; the kick
     ; pushes it back and up
     movss xmm0, [f_gx]
@@ -496,6 +510,122 @@ draw_viewmodel:
     lea rdi, [vm_flash]
     mov esi, VM_FLASH_N
     call fig_parts
+
+.hand:
+    ; ---- an empty hand, or the block or item held. The swing takes it
+    ; down and forward and back (sin of the way through)
+    movss xmm0, [hand_swing]
+    mulss xmm0, [f_pi]
+    movss [rsp + 20], xmm0
+    fld dword [rsp + 20]
+    fsin
+    fstp dword [rsp + 20]
+    movss xmm0, [f_hx]
+    addss xmm0, [rsp + 8]
+    movss xmm3, [rsp + 20]
+    mulss xmm3, [f_swingx]
+    addss xmm0, xmm3
+    movss xmm1, [rsp + 20]
+    mulss xmm1, [f_swingy]
+    addss xmm1, [f_hy]
+    addss xmm1, [rsp + 12]
+    movss xmm2, [rsp + 20]
+    mulss xmm2, [f_swingz]
+    addss xmm2, [f_hz]
+    call glTranslatef PLT
+    movss xmm0, [rsp + 20]
+    mulss xmm0, [f_swingrot]
+    movss xmm1, [f_one]
+    xorps xmm2, xmm2
+    xorps xmm3, xmm3
+    call glRotatef PLT
+    mov edi, [rsp + 16]
+    test edi, edi
+    jz .arm
+    ; lit like the place the player stands
+    mov edi, GL_TEXTURE_2D
+    call glEnable PLT
+    mov edi, GL_ALPHA_TEST
+    call glEnable PLT
+    cmp dword [rsp + 16], B_TORCH
+    jne .dim
+    mov dword [rsp], 256            ; a torch is its own light
+.dim:
+    cvtsi2ss xmm0, dword [rsp]
+    mulss xmm0, [f_inv256]
+    movaps xmm1, xmm0
+    movaps xmm2, xmm0
+    movss xmm3, [f_one]
+    call glColor4f PLT
+    mov edi, [rsp + 16]
+    call item_icon
+    test eax, eax
+    jnz .flat
+    movss xmm0, [f_blk_yaw]         ; a block: a corner toward the eye
+    xorps xmm1, xmm1
+    movss xmm2, [f_one]
+    xorps xmm3, xmm3
+    call glRotatef PLT
+    movss xmm0, [f_blk_tilt]
+    movss xmm1, [f_one]
+    xorps xmm2, xmm2
+    xorps xmm3, xmm3
+    call glRotatef PLT
+    movss xmm0, [f_blk_scale]
+    movaps xmm1, xmm0
+    movaps xmm2, xmm0
+    call glScalef PLT
+    jmp .held
+.flat:
+    movss xmm0, [f_itm_yaw]         ; an item: its picture, turned a little
+    xorps xmm1, xmm1
+    movss xmm2, [f_one]
+    xorps xmm3, xmm3
+    call glRotatef PLT
+    movss xmm0, [f_itm_roll]
+    xorps xmm1, xmm1
+    xorps xmm2, xmm2
+    movss xmm3, [f_one]
+    call glRotatef PLT
+    movss xmm0, [f_itm_scale]
+    movaps xmm1, xmm0
+    movaps xmm2, xmm0
+    call glScalef PLT
+.held:
+    mov edi, [rsp + 16]
+    call item_shape
+    mov edi, GL_TEXTURE_2D
+    call glDisable PLT
+    mov edi, GL_ALPHA_TEST
+    call glDisable PLT
+    movss xmm0, [f_one]
+    movaps xmm1, xmm0
+    movaps xmm2, xmm0
+    movaps xmm3, xmm0
+    call glColor4f PLT
+    jmp .noflash
+.arm:
+    movss xmm0, [f_ha_yaw]
+    xorps xmm1, xmm1
+    movss xmm2, [f_one]
+    xorps xmm3, xmm3
+    call glRotatef PLT
+    movss xmm0, [f_ha_tilt]
+    movss xmm1, [f_one]
+    xorps xmm2, xmm2
+    xorps xmm3, xmm3
+    call glRotatef PLT
+    movss xmm0, [f_ha_scale]
+    movaps xmm1, xmm0
+    movaps xmm2, xmm0
+    call glScalef PLT
+    mov eax, [rsp]
+    mov [fig_tint], eax
+    mov [fig_tint + 4], eax
+    mov [fig_tint + 8], eax
+    lea rdi, [vm_arm]
+    mov esi, VM_ARM_N
+    call fig_parts
 .noflash:
     mov dword [fig_tint], 256
     mov dword [fig_tint + 4], 256
@@ -511,8 +641,96 @@ draw_viewmodel:
 .out:
     LEAVE_FN
 
+; void view_bob(void) -> xmm0 x, xmm1 y: every frame before the view is
+; set up. Keeps the walking sway going (bob_t, and bob_amp easing in and
+; out so it never jumps) and the hand's swing; returns how far the view
+; is moved by the steps (0, 0 with VIEW BOB off).
+view_bob:
+    sub rsp, 24
+    ; the swing runs out
+    movss xmm0, [hand_swing]
+    movss xmm1, [dt]
+    mulss xmm1, [f_swingrate]
+    subss xmm0, xmm1
+    maxss xmm0, [f_zero]
+    movss [hand_swing], xmm0
+    ; walking on the ground?
+    xorps xmm2, xmm2                ; where bob_amp is heading
+    movss xmm0, [vel]
+    mulss xmm0, xmm0
+    movss xmm1, [vel + 8]
+    mulss xmm1, xmm1
+    addss xmm0, xmm1
+    comiss xmm0, [f_moving]
+    jbe .ease
+    cmp dword [on_ground], 0
+    je .ease
+    cmp dword [flying], 0
+    jne .ease
+    movss xmm2, [f_one]
+    sqrtss xmm0, xmm0
+    mulss xmm0, [f_bobrate]
+    mulss xmm0, [dt]
+    addss xmm0, [bob_t]
+    comiss xmm0, [f_bobwrap]
+    jb .t
+    subss xmm0, [f_bobwrap]
+.t:
+    movss [bob_t], xmm0
+.ease:
+    movss xmm0, [bob_amp]
+    subss xmm2, xmm0
+    movss xmm1, [dt]
+    mulss xmm1, [f_bobease]
+    minss xmm1, [f_one]
+    mulss xmm2, xmm1
+    addss xmm0, xmm2
+    movss [bob_amp], xmm0
+    xorps xmm0, xmm0
+    xorps xmm1, xmm1
+    cmp dword [set_bob], 0
+    je .out
+    fld dword [bob_t]
+    fsincos
+    fstp dword [rsp + 4]            ; cos
+    fstp dword [rsp]                ; sin
+    movss xmm0, [rsp]
+    mulss xmm0, [f_viewx]
+    mulss xmm0, [bob_amp]
+    movss xmm1, [rsp + 4]
+    andps xmm1, [rel absmask]
+    mulss xmm1, [f_viewy]
+    mulss xmm1, [bob_amp]
+.out:
+    add rsp, 24
+    ret
+
 section .rodata
 align 16
 absmask:    dd 0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff
+align 4
+f_pi:       dd 3.14159265
+f_inv256:   dd 0.00390625
+f_bobwrap:  dd 6.28318531
+f_bobease:  dd 8.0                  ; how fast the sway comes and goes
+f_viewx:    dd 0.022                ; the view's sway: sideways, and down
+f_viewy:    dd 0.040                ; (the world moves up) with each step
+f_swingrate: dd 4.0                 ; a swing takes a quarter of a second
+f_hx:       dd 0.40                 ; where the hand is in view
+f_hy:       dd -0.32
+f_hz:       dd -0.62
+f_swingx:   dd -0.10                ; the swing: in, down, forward, tipping
+f_swingy:   dd -0.07
+f_swingz:   dd -0.16
+f_swingrot: dd -55.0
+f_blk_yaw:  dd 38.0
+f_blk_tilt: dd 14.0
+f_itm_yaw:  dd -32.0
+f_itm_roll: dd 8.0
+f_blk_scale: dd 0.62
+f_itm_scale: dd 0.8
+f_ha_yaw:   dd 14.0                 ; the empty hand's arm
+f_ha_tilt:  dd 28.0
+f_ha_scale: dd 0.022
 
 NOEXECSTACK

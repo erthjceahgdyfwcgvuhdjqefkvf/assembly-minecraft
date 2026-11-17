@@ -1,17 +1,3 @@
-; items.asm - inventory, item and tool properties, dig rules, crafting,
-; furnaces and dropped-item entities.
-;
-; An inventory slot is a dword: byte 0 item id, byte 1 count, bytes 2-3
-; tool or armour damage. Slots 0-8 are the hotbar, 9-35 the main inventory;
-; the 4 armour slots (helmet, chestplate, leggings, boots) are apart. Item ids
-; below 128 are blocks (placeable), 128 and up are items (see common.inc).
-;
-; Dig rules follow Minecraft 1.6: each block has a hardness, a preferred
-; tool and sometimes a minimum pickaxe tier to drop anything. Digging takes
-; hardness x 1.5 seconds with a usable tool (x 5 without), divided by the
-; tool's speed when it is the right kind (wood 2, stone 4, iron 6,
-; diamond 8). Tools wear out.
-
 %include "common.inc"
 
 global inv, cursor, craft_grid, craft_out, craft_size
@@ -20,10 +6,10 @@ global tool_wear, item_stack, item_name, craft_update, craft_take
 global craft_return, smelt_result, fuel_time, tool_info, wool_rgb, dye_rgb
 global furnaces, furnace_find, furnace_add, furnace_remove, furnace_tick
 global ents, ent_count, ent_spawn, ent_update, ent_clear, drop_slot
-global ent_drop_all, item_valid, tool_of, solid_at, food_heal
-global armor, armor_piece, armor_points, armor_wear, armor_rgb
+global ent_drop_all, item_valid, tool_of, solid_at, food_heal, node_boxes
+global armor, armor_piece, armor_points, armor_wear, armor_rgb, recipes
 
-extern world_get, world_set, block_flags, pos, dt, snprintf
+extern world_get, world_set, block_flags, pos, dt, snprintf, sound_keep, meta_get
 
 NUM_INV     equ 36
 NUM_FURNACES equ 32
@@ -76,6 +62,9 @@ f_despawn:  dd 300.0
 f_eyeoff:   dd 0.8
 f_smelt:    dd 10.0
 f_box:      dd 0.125
+f_eight:    dd 8.0
+; stairs: the back quarter, x0 z0 x1 z1 in 1/8 nodes, facing +x -x +z -z
+stair_back: db 4,0,8,8,  0,0,4,8,  0,4,8,8,  0,0,8,4
 
 ; tool speed by tier 1-4
 tier_speed: dd 1.0, 2.0, 4.0, 6.0, 8.0
@@ -190,6 +179,31 @@ blk_rules:
     BLK  0.3, T_NONE,   0, 0, 0                 ; stained glass (breaks, as glass)
 %endrep
     BLK  3.0, T_NONE,   0, B_BEACON, 1          ; beacon
+    BLK  0.0, T_NONE,   0, B_TORCH, 1           ; torch on a wall
+    BLK  3.0, T_PICK,   2, I_DUST, 4            ; bluestone ore
+    BLK  5.0, T_PICK,   1, B_BLUEBLOCK, 1       ; block of bluestone
+; what each bluestone part (ids from W_FIRST) gives back
+part_drop:
+    times 16 db I_DUST
+    times 10 db I_BTORCH
+    times 10 db I_LEVER
+    times 8 db I_BUTTON
+    times 2 db I_PLATE
+    times 8 db I_REPEATER
+    times 8 db I_COMPARATOR
+    times 2 db I_LAMP
+    times 12 db I_PISTON
+    times 12 db I_SPISTON
+    times 6 db 0                                ; (a piston's head)
+    times 10 db I_RAIL
+    times 12 db I_PRAIL
+    times 4 db I_DOOR                           ; (drop_block asks door_drop)
+    times 2 db I_TRAPDOOR
+    db I_BIRCHLOG, I_DARKLOG, I_BIRCHPLANKS, I_DARKPLANKS
+    db 0                                        ; slab, stairs, chest: door_drop
+align 4
+f_doorhard: dd 1.5
+f_parthard: dd 0.75                             ; pistons and lamps take a moment
 
 ; per item id 128..158: tool kind, tier (for non-tools both 0)
 item_tools:
@@ -210,6 +224,11 @@ item_tools:
     db 0,0                                      ; wither skeleton spawn egg
     times 4 db 0,0                              ; slime, ghast, giant eggs, rifle
     db 0,0                                      ; slimeball
+    times 13 db 0,0                             ; bluestone parts, rails, minecart
+    times 4 db 0,0                              ; doors, trapdoors
+    times 12 db 0,0                             ; birch, dark oak, stairs, slabs, chest
+    db 0,0                                      ; beacon core
+    db 0,0                                      ; dragon portal
 
 ; colours of the 16 wool, concrete and dye colours (r, g, b)
 wool_rgb:
@@ -341,7 +360,48 @@ GL  equ B_GLASS
     RECIPE 3, 3, B_SGLASS + c, 8,  GL, GL, GL, GL, I_DYE + c, GL, GL, GL, GL
 %assign c c + 1
 %endrep
-    RECIPE 3, 3, B_BEACON, 1,      GL, GL, GL, GL, I_DIAMOND, GL, B_OBSIDIAN, B_OBSIDIAN, B_OBSIDIAN
+    RECIPE 3, 3, B_BEACON, 1,      GL, GL, GL, GL, I_BEACONCORE, GL, B_OBSIDIAN, B_OBSIDIAN, B_OBSIDIAN
+; bluestone
+DU  equ I_DUST
+SN  equ B_STONE
+BTO equ I_BTORCH
+FE  equ I_IRON
+AU  equ I_GOLD
+    STORAGE I_DUST, B_BLUEBLOCK
+    RECIPE 1, 2, I_BTORCH, 1,      DU, S, 0, 0,0,0, 0,0,0
+    RECIPE 1, 2, I_LEVER, 1,       S, C, 0, 0,0,0, 0,0,0
+    RECIPE 1, 1, I_BUTTON, 1,      SN, 0, 0, 0,0,0, 0,0,0
+    RECIPE 2, 1, I_PLATE, 1,       SN, SN, 0, 0,0,0, 0,0,0
+    RECIPE 3, 2, I_REPEATER, 1,    BTO, DU, BTO, SN, SN, SN, 0,0,0
+    RECIPE 3, 3, I_COMPARATOR, 1,  0, BTO, 0, BTO, DU, BTO, SN, SN, SN
+    RECIPE 3, 3, I_LAMP, 1,        0, DU, 0, DU, GL, DU, 0, DU, 0
+    RECIPE 3, 3, I_PISTON, 1,      P, P, P, C, FE, C, C, DU, C
+    RECIPE 1, 2, I_SPISTON, 1,     SB, I_PISTON, 0, 0,0,0, 0,0,0
+    RECIPE 3, 3, I_RAIL, 16,       FE, 0, FE, FE, S, FE, FE, 0, FE
+    RECIPE 3, 3, I_PRAIL, 6,       AU, 0, AU, AU, S, AU, AU, DU, AU
+    RECIPE 3, 2, I_CART, 1,        FE, 0, FE, FE, FE, FE, 0,0,0
+    RECIPE 1, 1, I_BUTTON, 1,      P, 0, 0, 0,0,0, 0,0,0       ; wooden button
+    RECIPE 2, 1, I_PLATE, 1,       P, P, 0, 0,0,0, 0,0,0       ; wooden plate
+    RECIPE 2, 3, I_DOOR, 3,        P, P, P, P, P, P, 0,0,0
+    RECIPE 2, 3, I_IRONDOOR, 3,    FE, FE, FE, FE, FE, FE, 0,0,0
+    RECIPE 3, 2, I_TRAPDOOR, 2,    P, P, P, P, P, P, 0,0,0
+    RECIPE 2, 2, I_IRONTRAP, 1,    FE, FE, FE, FE, 0,0, 0,0,0
+; birch and dark oak; the plank recipes above take any planks (craft_update),
+; so the ones that make a birch or dark oak thing come first
+PBI  equ I_BIRCHPLANKS
+PDK  equ I_DARKPLANKS
+    RECIPE 1, 1, I_BIRCHPLANKS, 4, I_BIRCHLOG, 0,0, 0,0,0, 0,0,0
+    RECIPE 1, 1, I_DARKPLANKS, 4,  I_DARKLOG, 0,0, 0,0,0, 0,0,0
+    RECIPE 3, 3, I_BIRCHSTAIRS, 4, PBI, 0, 0, PBI, PBI, 0, PBI, PBI, PBI
+    RECIPE 3, 3, I_DARKSTAIRS, 4,  PDK, 0, 0, PDK, PDK, 0, PDK, PDK, PDK
+    RECIPE 3, 1, I_BIRCHSLAB, 6,   PBI, PBI, PBI, 0,0,0, 0,0,0
+    RECIPE 3, 1, I_DARKSLAB, 6,    PDK, PDK, PDK, 0,0,0, 0,0,0
+    RECIPE 3, 3, I_OAKSTAIRS, 4,   P, 0, 0, P, P, 0, P, P, P
+    RECIPE 3, 1, I_OAKSLAB, 6,     P, P, P, 0,0,0, 0,0,0
+    RECIPE 3, 1, I_STONESLAB, 6,   SN, SN, SN, 0,0,0, 0,0,0
+    RECIPE 3, 3, I_CHEST, 1,       P, P, P, P, 0, P, P, P, P
+BC  equ B_BEACON
+    RECIPE 3, 3, I_DRAGONPORTAL, 1, BC, BC, BC, BC, I_FLESH, BC, BC, BC, BC
     db 0
 
 ; item names for tooltips
@@ -355,14 +415,14 @@ n_dirt:     NAME "DIRT"
 n_grass:    NAME "GRASS BLOCK"
 n_sand:     NAME "SAND"
 n_water:    NAME "WATER"
-n_log:      NAME "LOG"
+n_log:      NAME "OAK LOG"
 n_leaves:   NAME "LEAVES"
 n_snowdirt: NAME "SNOWY DIRT"
 n_dsand:    NAME "DESERT SAND"
 n_dstone:   NAME "DESERT STONE"
 n_drygrass: NAME "DRY GRASS"
 n_cobble:   NAME "COBBLESTONE"
-n_planks:   NAME "PLANKS"
+n_planks:   NAME "OAK PLANKS"
 n_glass:    NAME "GLASS"
 n_gravel:   NAME "GRAVEL"
 n_cactus:   NAME "CACTUS"
@@ -517,6 +577,39 @@ n_egggiant: NAME "GIANT SPAWN EGG"
 n_rifle:    NAME "ASSAULT RIFLE"
 n_slime:    NAME "SLIME BLOCK"
 n_slimeball: NAME "SLIMEBALL"
+n_blueore:  NAME "BLUESTONE ORE"
+n_blueblock: NAME "BLOCK OF BLUESTONE"
+n_dust:     NAME "BLUESTONE DUST"
+n_btorch:   NAME "BLUESTONE TORCH"
+n_lever:    NAME "LEVER"
+n_button:   NAME "BUTTON"
+n_plate:    NAME "PRESSURE PLATE"
+n_repeater: NAME "BLUESTONE REPEATER"
+n_comparator: NAME "BLUESTONE COMPARATOR"
+n_lamp:     NAME "BLUESTONE LAMP"
+n_piston:   NAME "PISTON"
+n_spiston:  NAME "STICKY PISTON"
+n_rail:     NAME "RAIL"
+n_prail:    NAME "POWERED RAIL"
+n_cart:     NAME "MINECART"
+n_birchlog: NAME "BIRCH LOG"
+n_darklog:  NAME "DARK OAK LOG"
+n_birchplanks: NAME "BIRCH PLANKS"
+n_darkplanks: NAME "DARK OAK PLANKS"
+n_oakstairs: NAME "OAK STAIRS"
+n_birchstairs: NAME "BIRCH STAIRS"
+n_darkstairs: NAME "DARK OAK STAIRS"
+n_stoneslab: NAME "STONE SLAB"
+n_oakslab:  NAME "OAK SLAB"
+n_birchslab: NAME "BIRCH SLAB"
+n_darkslab: NAME "DARK OAK SLAB"
+n_chest:    NAME "CHEST"
+n_beaconcore: NAME "BEACON CORE"
+n_dragonportal: NAME "DRAGON PORTAL"
+n_door:     NAME "WOODEN DOOR"
+n_irondoor: NAME "IRON DOOR"
+n_trapdoor: NAME "TRAPDOOR"
+n_irontrap: NAME "IRON TRAPDOOR"
 n_sglass_white: NAME "WHITE STAINED GLASS"
 n_sglass_orange: NAME "ORANGE STAINED GLASS"
 n_sglass_magenta: NAME "MAGENTA STAINED GLASS"
@@ -603,6 +696,8 @@ item_name:
     dq n_sglass_red
     dq n_sglass_black
     dq n_beacon
+    dq n_torch
+    dq n_blueore, n_blueblock
     times 128 - NUM_BLOCKS dq 0
     dq n_stick, n_coal, n_iron, n_gold, n_diamond
     dq n_wpick, n_spick, n_ipick, n_dpick, n_waxe, n_saxe, n_iaxe, n_daxe
@@ -635,6 +730,13 @@ item_name:
     dq n_bucket, n_wbucket, n_lbucket, n_milk, n_flint, n_fsteel, n_gunpowder
     dq n_eggwither, n_eggslime, n_eggghast, n_egggiant, n_rifle
     dq n_slimeball
+    dq n_dust, n_btorch, n_lever, n_button, n_plate, n_repeater, n_comparator
+    dq n_lamp, n_piston, n_spiston, n_rail, n_prail, n_cart
+    dq n_door, n_irondoor, n_trapdoor, n_irontrap
+    dq n_birchlog, n_darklog, n_birchplanks, n_darkplanks
+    dq n_oakstairs, n_birchstairs, n_darkstairs
+    dq n_stoneslab, n_oakslab, n_birchslab, n_darkslab, n_chest
+    dq n_beaconcore, n_dragonportal
     times 256 - I_END dq 0
 
 section .bss
@@ -686,6 +788,8 @@ init_tables:
     mov byte [rax + B_GOLD_ORE], I_GOLD
     mov byte [rax + B_LOG], I_COAL
     mov byte [rax + B_PINELOG], I_COAL
+    mov byte [rax + I_BIRCHLOG], I_COAL
+    mov byte [rax + I_DARKLOG], I_COAL
     lea rax, [fuel_time]
     mov byte [rax + I_COAL], 80
     mov byte [rax + B_COALBLOCK], 240
@@ -695,6 +799,17 @@ init_tables:
     mov byte [rax + B_LOG], 15
     mov byte [rax + B_PINELOG], 15
     mov byte [rax + B_PLANKS], 15
+    mov byte [rax + I_BIRCHLOG], 15
+    mov byte [rax + I_DARKLOG], 15
+    mov byte [rax + I_BIRCHPLANKS], 15
+    mov byte [rax + I_DARKPLANKS], 15
+    mov byte [rax + I_OAKSTAIRS], 15
+    mov byte [rax + I_BIRCHSTAIRS], 15
+    mov byte [rax + I_DARKSTAIRS], 15
+    mov byte [rax + I_OAKSLAB], 7
+    mov byte [rax + I_BIRCHSLAB], 7
+    mov byte [rax + I_DARKSLAB], 7
+    mov byte [rax + I_CHEST], 15
     mov byte [rax + B_CRAFTTABLE], 15
     mov byte [rax + I_STICK], 5
     mov byte [rax + I_PICK], 10
@@ -727,6 +842,8 @@ item_valid:
     je .out
     cmp edi, B_PORTAL
     je .out
+    cmp edi, B_TORCH_WALL
+    je .out                         ; the torch item, put on a wall
     cmp edi, B_FURNACE_LIT
     je .out
     cmp edi, B_FARMLAND
@@ -771,6 +888,8 @@ item_stack:
     cmp edi, I_FLINTSTEEL
     je .out
     cmp edi, I_RIFLE
+    je .out
+    cmp edi, I_CART
     je .out
     mov eax, 64
 .bed:
@@ -1084,13 +1203,26 @@ inv_add:
     add rsp, 8
     ret
 
+; edi: birch and dark oak logs and planks dig like oak (keeps the rest)
+wood_rules:
+    lea eax, [rdi - W_BIRCHLOG]
+    cmp eax, 3
+    ja .out
+    mov edi, B_LOG
+    cmp eax, 2
+    jb .out
+    mov edi, B_PLANKS
+.out:
+    ret
+
 ; float dig_time(int block, int held_item) - seconds, -1 = cannot be dug
 dig_time:
     push rbx
     call init_tables
+    call wood_rules
     mov ebx, edi
     cmp ebx, NUM_BLOCKS
-    jae .never
+    jae .part
     imul eax, ebx, BLK_SIZE
     lea r9, [blk_rules]
     add r9, rax
@@ -1125,6 +1257,22 @@ dig_time:
 .out:
     pop rbx
     ret
+.part:
+    ; bluestone parts come away at a touch; lamps and pistons take a moment
+    cmp ebx, W_END
+    jae .door
+    xorps xmm0, xmm0
+    cmp ebx, W_LAMP
+    jb .out
+    cmp ebx, W_DOOR
+    jae .door
+    cmp ebx, W_RAIL
+    jae .out
+    movss xmm0, [f_parthard]
+    jmp .out
+.door:
+    movss xmm0, [f_doorhard]
+    jmp .out
 .never:
     mov eax, 0xbf800000             ; -1.0
     movd xmm0, eax
@@ -1133,7 +1281,11 @@ dig_time:
 
 ; int can_harvest(int block, int held_item) - 1 if digging drops something
 can_harvest:
+    call wood_rules
     xor eax, eax
+    cmp edi, W_END
+    jae .out
+    mov eax, 1
     cmp edi, NUM_BLOCKS
     jae .out
     imul eax, edi, BLK_SIZE
@@ -1159,8 +1311,17 @@ can_harvest:
 ; int block_drop(int block) - slot dword of what digging it gives
 block_drop:
     xor eax, eax
-    cmp edi, NUM_BLOCKS
+    cmp edi, B_UNKNOWN
     jae .out
+    cmp edi, NUM_BLOCKS
+    jb .block
+    lea rcx, [part_drop]
+    movzx eax, byte [rcx + rdi - W_FIRST]
+    test eax, eax
+    jz .out
+    or eax, 1 << 8
+    ret
+.block:
     imul eax, edi, BLK_SIZE
     lea r9, [blk_rules]
     movzx ecx, byte [r9 + rax + 6]
@@ -1361,7 +1522,14 @@ craft_update:
     add eax, ecx
     movzx eax, byte [r14 + 4 + rax]
     cmp eax, edx
+    je .cellok
+    cmp eax, B_PLANKS               ; birch or dark oak planks will do
     jne .fail
+    cmp edx, I_BIRCHPLANKS
+    je .cellok
+    cmp edx, I_DARKPLANKS
+    jne .fail
+.cellok:
     inc r9d
     cmp r9d, r12d
     jb .col
@@ -1736,50 +1904,162 @@ ent_drop_all:
 ; solid: they are 1.5 nodes tall)
 ; locals: [0] y, [4] x, [8] y node, [12] z
 solid_at:
-    sub rsp, 24
-    movss [rsp], xmm1
-    FLOORF edi, xmm0, xmm7
-    FLOORF esi, xmm1, xmm7
-    FLOORF edx, xmm2, xmm7
-    mov [rsp + 4], edi
-    mov [rsp + 8], esi
-    mov [rsp + 12], edx
-    call world_get
-    lea rcx, [block_flags]
-    movzx eax, byte [rcx + rax]
-    test eax, F_HALF                ; a bed: solid below half a node
-    jz .nothalf
-    cvtsi2ss xmm7, dword [rsp + 8]
-    movss xmm6, [rsp]
-    subss xmm6, xmm7
-    xor eax, eax
-    comiss xmm6, [f_half]
-    jae .done
+    push rbx
+    push r12
+    push r13
+    sub rsp, 64
+    movss [rsp + 16], xmm0
+    movss [rsp + 20], xmm1
+    movss [rsp + 24], xmm2
+    FLOORF eax, xmm0, xmm7
+    mov [rsp + 28], eax
+    FLOORF eax, xmm1, xmm7
+    mov [rsp + 32], eax
+    FLOORF eax, xmm2, xmm7
+    mov [rsp + 36], eax
+    xor ebx, ebx                    ; the node, then the one below it
+.n:
+    mov edi, [rsp + 28]
+    mov esi, [rsp + 32]
+    sub esi, ebx
+    mov [rsp + 40], esi
+    mov edx, [rsp + 36]
+    lea rcx, [rsp]
+    call node_boxes
+    mov r12d, eax
+    xor r13d, r13d
+.b:
+    cmp r13d, r12d
+    jae .nn
+    lea r8, [r13 + r13*2]
+    lea r8, [rsp + r8*2]            ; the box: 6 bytes
+%macro INBOX 3                      ; axis, point, cell
+    movss xmm0, [rsp + %2]
+    cvtsi2ss xmm1, dword [rsp + %3]
+    subss xmm0, xmm1
+    mulss xmm0, [f_eight]
+    movzx eax, byte [r8 + %1]
+    cvtsi2ss xmm1, eax
+    comiss xmm0, xmm1
+    jb .bn
+    movzx eax, byte [r8 + %1 + 3]
+    cvtsi2ss xmm1, eax
+    comiss xmm0, xmm1
+    jae .bn
+%endmacro
+    INBOX 0, 16, 28
+    INBOX 1, 20, 40
+    INBOX 2, 24, 36
     mov eax, F_SOLID
     jmp .done
-.nothalf:
-    and eax, F_SOLID
-    jnz .done
-    mov edi, [rsp + 4]
-    mov esi, [rsp + 8]
-    dec esi
-    mov edx, [rsp + 12]
-    call world_get
-    lea rcx, [block_flags]
-    movzx eax, byte [rcx + rax]
-    and eax, F_SOLID | F_FENCE
-    cmp eax, F_SOLID | F_FENCE
-    mov eax, 0
-    jne .done
-    cvtsi2ss xmm7, dword [rsp + 8]
-    movss xmm6, [rsp]
-    subss xmm6, xmm7
-    comiss xmm6, [f_half]
-    jae .done
-    mov eax, F_SOLID
+.bn:
+    inc r13d
+    jmp .b
+.nn:
+    inc ebx
+    cmp ebx, 2
+    jb .n
+    xor eax, eax
 .done:
-    add rsp, 24
+    lea rsp, [rsp + 64]
+    pop r13
+    pop r12
+    pop rbx
     test eax, eax                   ; last: the flags are the result
+    ret
+
+; int node_boxes(int x, int y, int z, rcx -> 12 bytes) - the solid boxes of
+; the node, at most 2, each x0 y0 z0 x1 y1 z1 in 1/8 nodes: a whole block;
+; a fence or shut gate reaches half a node above its own; a bed is the
+; lower half; a slab one half; stairs a half and a quarter; a chest 7/8 tall
+node_boxes:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12d, edi
+    mov r13d, esi
+    mov r14d, edx
+    mov rbx, rcx
+    call world_get
+    cmp eax, W_SHAPE
+    je .shape
+    lea rcx, [block_flags]
+    movzx ecx, byte [rcx + rax]
+    test ecx, F_SOLID
+    jz .half
+    test ecx, F_FENCE
+    jnz .fence
+    mov dword [rbx], 0x08000000     ; 0,0,0, 8,8,8
+    mov word [rbx + 4], 0x0808
+    jmp .one
+.fence:
+    mov dword [rbx], 0x08000000
+    mov word [rbx + 4], 0x080c
+    jmp .one
+.half:
+    xor eax, eax
+    test ecx, F_HALF
+    jz .out
+    mov dword [rbx], 0x08000000
+    mov word [rbx + 4], 0x0804
+    jmp .one
+.shape:
+    mov edi, r12d
+    mov esi, r13d
+    mov edx, r14d
+    call meta_get
+    test eax, 0x80
+    jz .notportal
+    xor eax, eax                    ; a green portal: walked into
+    jmp .out
+.notportal:
+    test eax, 0x40
+    jz .slab
+    mov dword [rbx], 0x08000000     ; a chest
+    mov word [rbx + 4], 0x0807
+    jmp .one
+.slab:
+    mov r15d, eax
+    xor ecx, ecx                    ; the lower half, or the upper
+    test eax, 4
+    jz .low
+    mov ecx, 4
+.low:
+    mov dword [rbx], 0x08000000
+    mov [rbx + 1], cl
+    add ecx, 4
+    mov [rbx + 4], cl
+    mov byte [rbx + 5], 8
+    mov eax, 1
+    test r15d, 8
+    jz .out
+    ; stairs: the other half over the back of the node
+    mov eax, r15d
+    and eax, 3
+    lea rcx, [stair_back]
+    mov eax, [rcx + rax*4]          ; x0, z0, x1, z1
+    mov [rbx + 6], al
+    mov [rbx + 8], ah
+    shr eax, 16
+    mov [rbx + 9], al
+    mov [rbx + 11], ah
+    movzx ecx, byte [rbx + 1]
+    xor ecx, 4                      ; 0 <-> 4
+    mov [rbx + 7], cl
+    add ecx, 4
+    mov [rbx + 10], cl
+    mov eax, 2
+    jmp .out
+.one:
+    mov eax, 1
+.out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; void ent_update(void) - gravity, ground, pickup, despawn
@@ -1887,6 +2167,7 @@ ent_update:
     mov [rbx + EN_SLOT], eax
     test eax, eax
     jnz .next
+    SFX S_POP, 60, 100
 .remove:
     ; move the last entity into this place
     mov eax, [ent_count]

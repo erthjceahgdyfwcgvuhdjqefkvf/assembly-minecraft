@@ -1,19 +1,3 @@
-; horizon.asm - far terrain beyond the real chunks, Distant-Horizons style.
-;
-; Only the chunks within REAL CHUNKS of the player are the actual game.
-; Out to HORIZON (32-64 chunks) the world is shown as a light shell built
-; straight from the v7 noise: each 256x256 tile is a 32x32 grid of 8-node
-; cells (16-node cells further away). Cell corners average the heights
-; around them, so the far land is a smooth sloped surface, coloured by
-; the top block (its side colour on cliffs), shaded by slope and jittered
-; per cell. Skirts hang from tile edges to hide cracks between levels of
-; detail.
-; Nothing out there is stored as blocks, simulated or lit.
-;
-; Tile data comes from the world-gen thread (mapgen_horizon_tile); meshes
-; are built here on the main thread. Cells over the real chunks are left
-; out, and tiles along that edge are rebuilt as the player moves.
-
 %include "common.inc"
 
 global horizon_update, horizon_draw, horizon_reset, horizon_finish
@@ -22,7 +6,7 @@ global horizon_cube_verts
 
 extern set_horizon, set_range, cur_pcx, cur_pcz, spiral_r2, seed, threaded
 extern dimension
-extern worker_submit_horizon, mapgen_horizon_tile
+extern worker_submit_horizon, mapgen_horizon_tile, gen_active
 extern vbo_ok, p_genbuf, p_bindbuf, p_bufdata, client_pointers, unbind_vbo
 extern tint_begin, world_tex_end, frustum_box, stat_verts, world_tex_begin
 extern build_cubes, cz_buf, cz_n, cube_r1sq, cube_r2sq
@@ -368,7 +352,7 @@ build_tile:
     ; top in 1/8 nodes: water sits at 1 7/8
     mov r9d, 15
     mov r10d, ecx
-    and r10d, 0x7f
+    and r10d, 0x1f
     cmp r10d, B_WATER
     je .t8
     lea r9d, [rax + 1]
@@ -425,7 +409,7 @@ build_tile:
 %macro CSUM 1
     add eax, [r8 + rdx*4 + %1 * 4]
     movzx ecx, byte [r9 + rdx + %1]
-    and ecx, 0x7f
+    and ecx, 0x1f
     cmp ecx, B_WATER
     jne %%d
     mov r10d, 1
@@ -580,7 +564,7 @@ build_tile:
     lea rax, [cell_col]
     movzx edi, byte [rax + rdx]
     mov esi, edi
-    and esi, 0x7f
+    and esi, 0x1f
     lea r10, [pal]
     lea r10, [r10 + rsi*8]
     cmp esi, B_WATER
@@ -970,6 +954,14 @@ horizon_update:
     jmp %1
 %%no:
 %endmacro
+    ; one with cubes, 3 chunks on: their faces were chosen for where
+    ; the player was (lodcube.asm), and cubes left behind go smooth again
+    cmp r8d, 3
+    jb .near
+    lea rax, [hz_nverts]
+    cmp dword [rax + rbx*4 + HZ_SLOTS * 4], 0
+    jne .build
+.near:
     ; next to the real chunks: every chunk step (no gaps at their edge)
     mov ecx, [set_range]
     add ecx, 2
@@ -1008,7 +1000,10 @@ horizon_update:
     mov byte [rax + rbx], HS_PENDING
     jmp .tx_next
 .sync:
-    ; no second core: one tile per frame on this thread
+    ; no second core: one tile per frame on this thread (not while a
+    ; chunk is half made: the frame has had its share of world gen)
+    cmp dword [gen_active], 0
+    jne .out
     cmp dword [rsp + 20], 0
     jne .tx_next
     mov edi, [rsp + 12]

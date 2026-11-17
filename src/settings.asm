@@ -1,10 +1,3 @@
-; settings.asm - user settings: table, config file, change flags.
-;
-; Settings live in $XDG_CONFIG_HOME/voxasm.conf (or ~/.config/voxasm.conf),
-; one "name value" pair per line. Because the path comes from $HOME, an
-; AppImage portable home folder (VoxASM-x86_64.AppImage.home) keeps them
-; next to the AppImage.
-
 %include "common.inc"
 
 global settings_table, settings_count, settings_load, settings_save, rend_loaded
@@ -14,7 +7,7 @@ global key_name, binds_reset, controls_key
 global settings_change, settings_label, settings_pending
 global set_range, set_lod, set_renderer, set_textures, set_leaves
 global set_clouds, set_fog, set_vsync, set_fov, set_mouse, set_window
-global set_showfps, set_horizon, set_daycycle, set_difficulty
+global set_showfps, set_horizon, set_daycycle, set_difficulty, set_sound, set_fpscap, set_bob
 
 extern getenv, snprintf, fopen, fclose, fprintf, fscanf, strcmp, mkdir, state
 
@@ -39,7 +32,7 @@ SE_MAX      equ 36
 SE_STEP     equ 40
 SE_FLAGS    equ 44
 SE_SIZE     equ 48
-NUM_SETTINGS equ 15
+NUM_SETTINGS equ 18
 
 %macro SETTING 8                    ; key, label, var, names, min, max, step, flags
     dq %1, %2, %3, %4
@@ -62,7 +55,10 @@ set_fov:        dd 70
 set_mouse:      dd 5
 set_window:     dd 2
 set_showfps:    dd 1
-set_difficulty: dd 1                ; 0 peaceful (no zombies), 1 normal
+set_difficulty: dd 1                ; 0 peaceful (no zombies), 1 normal, 2 hard
+set_sound:      dd 7                ; volume 0 (off) .. 10
+set_fpscap:     dd 0                ; 0 off, 1 = 30, 2 = 60 frames a second
+set_bob:        dd 1                ; the view sways with the steps
 settings_pending: dd 0
 ; key bindings: key index (letters and symbols by their lower-case
 ; character, other keys 256 + the low byte of their X keysym)
@@ -102,7 +98,10 @@ settings_table:
     SETTING k_window, l_window, set_window,   n_window,  0, 3,   1,  APPLY_WINDOW
     SETTING k_fps,    l_fps,    set_showfps,  n_onoff,   0, 1,   1,  0
     SETTING k_day,    l_day,    set_daycycle, n_onoff,   0, 1,   1,  0
-    SETTING k_diff,   l_diff,   set_difficulty, n_diff,  0, 1,   1,  0
+    SETTING k_diff,   l_diff,   set_difficulty, n_diff,  0, 2,   1,  0
+    SETTING k_sound,  l_sound,  set_sound,    0,         0, 10,  1,  SHOW_OFF_AT_0
+    SETTING k_cap,    l_cap,    set_fpscap,   n_cap,     0, 2,   1,  0
+    SETTING k_bob,    l_bob,    set_bob,      n_onoff,   0, 1,   1,  0
 
 n_rend:     dq s_vbo, s_dlist, s_varr
 n_tex:      dq s_t16, s_t8, s_t4, s_tflat
@@ -110,7 +109,8 @@ n_leaves:   dq s_fancy, s_opaque
 n_onoff:    dq s_off, s_on
 n_window:   dq s_w0, s_w1, s_w2, s_w3
 n_horiz:    dq s_off, s_h32, s_h48, s_h64
-n_diff:     dq s_peaceful, s_normal
+n_diff:     dq s_peaceful, s_normal, s_hard
+n_cap:      dq s_off, s_cap30, s_cap60
 
 section .rodata
 k_range:    db "range", 0
@@ -129,8 +129,17 @@ k_horiz:    db "horizon", 0
 k_day:      db "day_cycle", 0
 k_diff:     db "difficulty", 0
 l_diff:     db "DIFFICULTY", 0
+k_sound:    db "sound", 0
+l_sound:    db "SOUND", 0
+k_cap:      db "fps_cap", 0
+k_bob:      db "view_bob", 0
+l_bob:      db "VIEW BOB", 0
+l_cap:      db "FPS LIMIT", 0
+s_cap30:    db "30", 0
+s_cap60:    db "60", 0
 s_peaceful: db "PEACEFUL", 0
 s_normal:   db "NORMAL", 0
+s_hard:     db "HARD", 0
 l_range:    db "REAL CHUNKS", 0
 l_lod:      db "COARSE TERRAIN FROM", 0
 l_rend:     db "RENDERER", 0

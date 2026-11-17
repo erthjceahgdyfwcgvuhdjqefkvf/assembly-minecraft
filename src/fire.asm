@@ -1,12 +1,3 @@
-; fire.asm - fire from flint and steel.
-;
-; Each fire node is kept in a list (fires seen while meshing a loaded chunk
-; join it, so fire from a save keeps burning). About once a second a fire
-; may spread into each burnable block next to it (wood, leaves, wool,
-; plants, beds...), which becomes fire in turn, and lights TNT; after a few
-; seconds it goes out, leaving the burnt blocks gone. Fire on netherrack
-; burns forever. Water flowing in puts fire out (liquid.asm).
-
 %include "common.inc"
 
 global fire_clear, fire_add, fire_set, fire_update, flammable, fires, fire_count

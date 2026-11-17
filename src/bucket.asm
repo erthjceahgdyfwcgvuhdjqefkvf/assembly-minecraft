@@ -1,15 +1,9 @@
-; bucket.asm - buckets of water, lava and milk.
-;
-; An empty bucket right-clicked at a cow (a grown one) fills with milk;
-; otherwise it takes the first still water or lava along the view (flowing
-; liquid cannot be picked up). A full bucket pours its source into the
-; free cell in front of the block looked at and is empty again. Milk is
-; drunk: 1 heart back. Creative keeps full buckets full.
-
 %include "common.inc"
 
 global bucket_use
 
+extern sound_keep, sound_keep_at
+extern eye_h
 extern pos, pitch, syaw, cyaw, inv, sel_slot, game_mode, hp, target_hit
 extern target, world_get, world_set, block_flags, mob_pick, mobs
 extern inv_add_slot, throw_item, dimension
@@ -114,14 +108,15 @@ bucket_use:
 .put:
     cmp r12d, B_WATER
     jne .pourit
-    cmp dword [dimension], 0
-    jne .poured                     ; water boils away in the nether
+    cmp dword [dimension], 1
+    je .poured                      ; water boils away in the nether
 .pourit:
     mov edi, [target + 12]
     mov esi, [target + 16]
     mov edx, [target + 20]
     mov ecx, r12d
     call world_set
+    SFX S_SPLASH, 60, 140
 .poured:
     cmp dword [game_mode], 0
     jne .yes
@@ -166,7 +161,7 @@ bucket_use:
     mov eax, [pos]
     mov [rsp], eax
     movss xmm0, [pos + 4]
-    addss xmm0, [f_eye]
+    addss xmm0, [eye_h]
     movss [rsp + 4], xmm0
     mov eax, [pos + 8]
     mov [rsp + 8], eax
@@ -212,6 +207,7 @@ bucket_use:
     mov edx, r15d
     xor ecx, ecx
     call world_set
+    SFX S_SPLASH, 50, 160
     mov edi, r13d
     call fill
 .yes:

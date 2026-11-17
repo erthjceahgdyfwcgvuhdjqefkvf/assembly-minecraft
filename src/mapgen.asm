@@ -1,26 +1,10 @@
-; mapgen.asm - Luanti mapgen v7 ported to x86-64 assembly.
-;
-; Follows luanti/src/mapgen/mapgen_v7.cpp with the default flags
-; (mountains + ridges/rivers, no floatlands), the original heat/humidity
-; biome generator (mg_biome.cpp), MapgenBasic::generateBiomes,
-; CavesNoiseIntersection tunnels and simple tree decorations.
-;
-; Differences from Luanti, kept small on purpose:
-;  * world height is clipped to y -64..191 (one 16x256x16 column per chunk)
-;  * mountain 3D noise is sampled every 4 nodes in y and interpolated
-;    (its y spread is 350 so this is visually identical, ~3x cheaper)
-;  * biomes are a fixed built-in set modelled on Minetest Game's
-;  * caverns (only below y -256) and dungeons are not generated
-;
-; Not reentrant: uses module globals. Only the world-gen thread calls it.
-
 %include "common.inc"
 
 global mapgen_chunk, mapgen_base_height, mapgen_flat, mapgen_finish
-global mapgen_horizon_tile, nether_chunk, nether_finish
+global mapgen_horizon_tile, nether_chunk, nether_finish, end_chunk, end_pillars
 global np_terrain_base, np_terrain_alt, np_terrain_persist, np_height_select
 global np_filler_depth, np_mount_height, np_ridge_uwater, np_mountain
-global np_ridge, np_cave1, np_cave2
+global np_ridge, np_cave1, np_cave2, mapgen_begin, mapgen_step
 
 extern noise_fractal2d, noise_fractal2d_p, noise_fractal3d
 extern block_flags, noise3d_value
@@ -135,9 +119,21 @@ ore_table:
     dd 4, 44                        ; y -60 .. -16
     db B_DIAMOND_ORE, 2, 5, 0
     dd 4, 16                        ; y -60 .. -44
+    db B_BLUE_ORE, 5, 7, 0
+    dd 4, 44                        ; y -60 .. -16
     db B_CLAY, 10, 16, B_SAND
     dd 52, 14                       ; y -12 .. 1: sea and lake floors
     db 0
+
+tree_logs:  db B_LOG, B_LOG, W_BIRCHLOG, W_DARKLOG
+align 4
+; the island's pillars: x, z, radius squared, height over the island, caged
+end_pillars:
+    dd  30,   0, 5, 18, 0
+    dd   9,  28, 8, 26, 1
+    dd -24,  18, 5, 22, 0
+    dd -24, -18, 8, 30, 1
+    dd   9, -28, 5, 24, 0
 
 section .bss
 alignb 16
@@ -147,6 +143,9 @@ g_hmap:      resq 1
 g_bx:        resd 1
 g_bz:        resd 1
 g_seed:      resd 1
+mg_stage:    resd 1                 ; mapgen_step: the slice to do next
+mg_c0:       resd 1                 ; and the columns of that slice
+mg_c1:       resd 1
 nd_grid:     resd 5 * 5 * 33         ; nether density samples
 nd_col:      resd 33
 g_fx:        resd 1
@@ -166,9 +165,19 @@ section .text
 ; ---------------------------------------------------------------------------
 ; int mapgen_chunk(u8 *blocks, u16 *hmap, int cx, int cz, int seed)
 mapgen_chunk:
-    ENTER_FN 0
-    cmp dword [mapgen_flat], 0
-    jne flat_chunk
+    sub rsp, 8
+    call mapgen_begin
+.step:
+    call mapgen_step
+    test eax, eax
+    js .step
+    add rsp, 8
+    ret
+
+; void mapgen_begin(u8 *blocks, u16 *hmap, int cx, int cz, int seed) - start
+; a chunk that mapgen_step then makes a slice at a time (so a computer with
+; one core can spread a chunk over several frames)
+mapgen_begin:
     mov [g_blocks], rdi
     mov [g_hmap], rsi
     shl edx, 4
@@ -176,14 +185,66 @@ mapgen_chunk:
     shl ecx, 4
     mov [g_bz], ecx
     mov [g_seed], r8d
+    mov dword [mg_stage], 0
+    ret
+
+; int mapgen_step(void) - the next slice of the chunk begun: -1 while there
+; is more to do, else the highest non-air y index (the chunk is finished)
+MG_COLS     equ 4                   ; slices of the column noise,
+MG_TERR     equ 8                   ; the terrain fill
+MG_CAVE     equ 8                   ; and the tunnels (256 columns each)
+mapgen_step:
+    ENTER_FN 0
+    cmp dword [mapgen_flat], 0
+    je .staged
+    mov rdi, [g_blocks]
+    mov rsi, [g_hmap]
+    call flat_fill
+    LEAVE_FN
+.staged:
+    mov ebx, [mg_stage]
+    inc dword [mg_stage]
+    cmp ebx, MG_COLS
+    jae .s1
+    shl ebx, 6
+    mov [mg_c0], ebx
+    add ebx, 64
+    mov [mg_c1], ebx
     call mg_columns
+    jmp .more
+.s1:
+    sub ebx, MG_COLS
+    cmp ebx, MG_TERR
+    jae .s2
+    shl ebx, 5
+    mov [mg_c0], ebx
+    add ebx, 32
+    mov [mg_c1], ebx
     call mg_terrain
+    jmp .more
+.s2:
+    sub ebx, MG_TERR
+    jnz .s3
     call mg_biomes
+    jmp .more
+.s3:
+    dec ebx
+    cmp ebx, MG_CAVE
+    jae .s4
+    shl ebx, 5
+    mov [mg_c0], ebx
+    add ebx, 32
+    mov [mg_c1], ebx
     call mg_caves
+    jmp .more
+.s4:
     call mg_ores
     call mg_trees
     call mg_grass
     call mg_heightmap
+    LEAVE_FN
+.more:
+    mov eax, -1
     LEAVE_FN
 
 ; int mapgen_finish(u8 *blocks, u16 *hmap) - heightmap and max y of a chunk
@@ -198,7 +259,7 @@ mapgen_finish:
 
 ; Flat world for building: bedrock, two dirt layers and grass on the world
 ; floor (y -64..-61), nothing else. rdi blocks, rsi heightmap; returns max y.
-flat_chunk:
+flat_fill:
     mov rdx, rsi
     xor eax, eax
     mov ecx, CHUNK_VOX
@@ -217,7 +278,7 @@ flat_chunk:
     cmp ecx, 256
     jb .col
     mov eax, 3
-    LEAVE_FN
+    ret
 
 ; int mapgen_base_height(int x, int z, int seed) - test helper
 mapgen_base_height:
@@ -292,7 +353,7 @@ mg_surface_at:
 ; filler depth and biome.
 mg_columns:
     ENTER_FN 32
-    xor r12d, r12d
+    mov r12d, [mg_c0]               ; columns mg_c0 .. mg_c1 - 1
 .col:
     mov eax, r12d
     and eax, 15
@@ -366,7 +427,7 @@ mg_columns:
     mov [rcx + r12], al
 
     inc r12d
-    cmp r12d, 256
+    cmp r12d, [mg_c1]
     jb .col
     LEAVE_FN
 
@@ -393,7 +454,7 @@ mg_msample:
 ; Column fill: MapgenV7::generateTerrain
 mg_terrain:
     ENTER_FN 32
-    xor r12d, r12d
+    mov r12d, [mg_c0]               ; columns mg_c0 .. mg_c1 - 1
 .col:
     mov eax, r12d
     and eax, 15
@@ -496,7 +557,7 @@ mg_terrain:
     cmp r15d, WORLD_H
     jb .y
     inc r12d
-    cmp r12d, 256
+    cmp r12d, [mg_c1]
     jb .col
     LEAVE_FN
 
@@ -639,7 +700,7 @@ mg_contour:
 ; ebx bit0 column_is_open, bit1 is_under_tunnel, bit2 is_top_filler_above
 mg_caves:
     ENTER_FN 32
-    xor r12d, r12d
+    mov r12d, [mg_c0]               ; columns mg_c0 .. mg_c1 - 1
 .col:
     mov eax, r12d
     and eax, 15
@@ -751,7 +812,7 @@ mg_caves:
     dec r15d
     jnz .y                          ; y index 0 stays solid floor
     inc r12d
-    cmp r12d, 256
+    cmp r12d, [mg_c1]
     jb .col
     LEAVE_FN
 
@@ -982,7 +1043,12 @@ mg_trees:
     div ecx
     lea eax, [rdx + 4]
     mov [rsp + 4], eax
-    mov dword [rsp + 8], B_LOG
+    mov ecx, [rsp]                  ; oak (half of them), birch or dark oak
+    shr ecx, 26
+    and ecx, 3
+    lea rdx, [tree_logs]
+    movzx ecx, byte [rdx + rcx]
+    mov [rsp + 8], ecx
     call .trunk
     mov ebx, -2
 .al:
@@ -1121,7 +1187,7 @@ mg_trees:
 ; void mapgen_horizon_tile(int tx, int tz, int seed, s16 *heights,
 ;                          u8 *tops, u64 *cols)
 ; heights: top of the solid stack standing on the ground (floating parts
-; left out); tops: block id, bit 7 = forest; cols: u32 mask of solid
+; left out); tops: block id (bits 0-4), bit 7 = forest of tree bits 5-6; cols: u32 mask of solid
 ; mountain levels above the ground (bit k = y -64 + 8k .. +8), then s16
 ; ground height (top solid node without mountains).
 ; locals: [0] fx, [4] fz, [8] mount height, [12] heat, [16] top, [20] cell,
@@ -1293,6 +1359,9 @@ mapgen_horizon_tile:
     cmp word [r14 + BI_DENSITY], 1000
     jb .store
     or ecx, 0x80                    ; forest canopy
+    movzx edx, byte [r14 + BI_TREE] ; and its trees (bits 5-6)
+    shl edx, 5
+    or ecx, edx
 .store:
     mov edx, [rsp + 20]
     mov rsi, [rsp + 40]
@@ -1696,6 +1765,167 @@ nether_chunk:
 
 ; int nether_finish(u8 *blocks, u16 *hmap) - after loading a nether chunk:
 ; the highest y index in use, and the heightmap all 0
+; int end_chunk(u8 *blocks, u16 *hmap, int cx, int cz, int seed) - the
+; dragon's island: a round floating island of dirt, grassed over, round (0, 0),
+; thick in the middle and thin at its ragged edge, five obsidian pillars
+; (bedrock on top, two in fence cages) and in the middle a bedrock fountain
+; (a pool for the way home and a column the dragon perches on). Nothing
+; else: the void. Returns the highest y index.
+; locals: [0] x, [4] z, [8] lx, [12] lz
+%macro EPUT 2                       ; world y, block: into column rbx
+    mov eax, %1
+    sub eax, WORLD_YMIN
+    mov byte [rbx + rax], %2
+%endmacro
+end_chunk:
+    ENTER_FN 32
+    mov [g_blocks], rdi
+    mov [g_hmap], rsi
+    shl edx, 4
+    mov [g_bx], edx
+    shl ecx, 4
+    mov [g_bz], ecx
+    xor eax, eax
+    mov ecx, CHUNK_VOX
+    rep stosb                       ; all air
+    mov dword [rsp + 12], 0
+.lz:
+    mov dword [rsp + 8], 0
+.lx:
+    mov eax, [rsp + 8]
+    add eax, [g_bx]
+    mov [rsp], eax
+    mov eax, [rsp + 12]
+    add eax, [g_bz]
+    mov [rsp + 4], eax
+    ; the column
+    mov eax, [rsp + 12]
+    shl eax, 12
+    mov ecx, [rsp + 8]
+    shl ecx, 8
+    or eax, ecx
+    mov rbx, [g_blocks]
+    add rbx, rax
+    ; the island: reach with a ragged edge, thickness falling off outwards
+    mov eax, [rsp]
+    sar eax, 2
+    imul eax, eax, 73856093
+    mov ecx, [rsp + 4]
+    sar ecx, 2
+    imul ecx, ecx, 19349663
+    xor eax, ecx
+    mov ecx, eax
+    shr ecx, 13
+    xor eax, ecx
+    imul eax, eax, 0x5bd1e995
+    shr eax, 24                     ; 0 .. 255
+    lea r12d, [rax*2 + END_R * END_R - 256]  ; reach squared
+    mov eax, [rsp]
+    imul eax, eax
+    mov ecx, [rsp + 4]
+    imul ecx, ecx
+    add eax, ecx
+    mov r13d, eax                   ; d squared
+    cmp r13d, r12d
+    jge .pillars
+    mov eax, r12d
+    sub eax, r13d
+    imul eax, eax, 26
+    xor edx, edx
+    div r12d
+    add eax, 3                      ; thickness under the top
+    mov ecx, END_TOP
+    sub ecx, eax
+    sub ecx, WORLD_YMIN
+    mov edx, END_TOP - WORLD_YMIN
+.fill:
+    mov byte [rbx + rcx], B_DIRT
+    inc ecx
+    cmp ecx, edx
+    jle .fill
+    mov byte [rbx + rdx], B_GRASS   ; grass on top
+.pillars:
+    xor r14d, r14d
+.p:
+    imul eax, r14d, 20
+    lea r15, [end_pillars]
+    add r15, rax
+    mov eax, [rsp]
+    sub eax, [r15]
+    mov r8d, eax                    ; dx
+    imul eax, eax
+    mov ecx, [rsp + 4]
+    sub ecx, [r15 + 4]
+    mov r9d, ecx                    ; dz
+    imul ecx, ecx
+    add eax, ecx
+    cmp eax, [r15 + 8]
+    jg .pn
+    mov ecx, END_TOP + 1 - WORLD_YMIN
+    mov edx, [r15 + 12]
+    add edx, END_TOP - WORLD_YMIN
+.ob:
+    mov byte [rbx + rcx], B_OBSIDIAN
+    inc ecx
+    cmp ecx, edx
+    jle .ob
+    ; on top: bedrock under the crystal; round two of them a cage
+    mov eax, r8d
+    or eax, r9d
+    jnz .cage
+    mov byte [rbx + rdx + 1], B_BEDROCK
+.cage:
+    cmp dword [r15 + 16], 0
+    je .pn
+    mov eax, r8d
+    add eax, 1
+    cmp eax, 2
+    ja .pn
+    mov eax, r9d
+    add eax, 1
+    cmp eax, 2
+    ja .pn
+    mov byte [rbx + rdx + 4], B_FENCE   ; the roof
+    mov eax, r8d
+    or eax, r9d
+    jz .pn
+    mov byte [rbx + rdx + 2], B_FENCE   ; the sides
+    mov byte [rbx + rdx + 3], B_FENCE
+.pn:
+    inc r14d
+    cmp r14d, END_PILLARS
+    jb .p
+    ; the fountain in the middle
+    cmp r13d, 10
+    jg .next
+    test r13d, r13d
+    jnz .ring
+    mov ecx, END_TOP - 1 - WORLD_YMIN
+.col:
+    mov byte [rbx + rcx], B_BEDROCK
+    inc ecx
+    cmp ecx, END_TOP + 4 - WORLD_YMIN
+    jle .col
+    jmp .next
+.ring:
+    cmp r13d, 5
+    jg .rim
+    EPUT END_TOP, B_AIR             ; the pool, where the way home opens
+    EPUT END_TOP - 1, B_BEDROCK
+    jmp .next
+.rim:
+    EPUT END_TOP, B_BEDROCK
+    EPUT END_TOP + 1, B_BEDROCK
+.next:
+    inc dword [rsp + 8]
+    cmp dword [rsp + 8], 16
+    jb .lx
+    inc dword [rsp + 12]
+    cmp dword [rsp + 12], 16
+    jb .lz
+    call mg_heightmap
+    LEAVE_FN
+
 nether_finish:
     sub rsp, 8
     mov [g_blocks], rdi

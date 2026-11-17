@@ -1,18 +1,9 @@
-; invui.asm - inventory, crafting table, furnace and creative screens.
-;
-; Minecraft-style slot handling with a stack on the mouse cursor:
-;   left click   pick up / put down / merge / swap a whole stack
-;   right click  pick up half, or put down one item
-; Crafting output slots take the result (and use up one of each input).
-; Creative mode shows every item instead of crafting; clicking one picks
-; up a full stack. The survival inventory has the 4 armour slots next to
-; the player; each takes only its piece. Q throws one of the stack on the
-; mouse (or under it), holding Q throws the whole stack.
-
 %include "common.inc"
 
 global invui_frame, invui_close, invui_open, cur_furnace, dye_in, dye_out, dye_color
 global palette, palette_n, palette_top, invui_qpress
+global book_tick, book_clear, book_rebuild, book_seen, book_open, book_fill, book_known
+global book_list, book_n, book_ghost, panel_x, panel_y
 
 extern state, mouse_x, mouse_y, mouse_click, win_w, win_h, game_mode
 extern inv, cursor, craft_grid, craft_out, craft_size, craft_update
@@ -21,6 +12,8 @@ extern furnaces, smelt_result, fuel_time
 extern hud_rect, hud_text, hud_item, hud_begin, draw_figure
 extern resume_game, sel_slot, mouse_wheel, tool_info, dye_rgb, inv_add_slot
 extern drop_slot, armor, armor_piece, throw_item, keys, bind_drop, dt, menu_lmb
+extern cur_chest, recipes, hud_message, body_water, body_lava
+extern beacon_sel, beacon_status, effect_icon, meta_get, meta_set, sound_keep
 
 SLOT_PX     equ 36                  ; slot size on screen
 SLOT_STEP   equ 40
@@ -32,6 +25,10 @@ SB_Y        equ 36
 SB_W        equ 16
 SB_H        equ 6 * SLOT_STEP - 4
 SB_MINTHUMB equ 24
+BOOK_W      equ 5 * SLOT_STEP + 16  ; the recipe book's panel
+BOOK_COLS   equ 5
+BOOK_ROWS   equ 6
+RC_SIZE     equ 16                  ; items.asm recipe rows
 FU_IN       equ 12
 FU_FUEL     equ 16
 FU_OUT      equ 20
@@ -50,6 +47,7 @@ f_half:     dd 0.5
 f_smelt:    dd 10.0
 f_zero:     dd 0.0
 f_34:       dd 34.0
+f_onehalf:  dd 1.5
 f_fig:      dd 4.0                  ; player figure scale (pixels per unit)
 f_tipline:  dd 20.0
 f_qhold:    dd 0.4                  ; holding Q this long throws the stack
@@ -63,6 +61,20 @@ s_colour:   db "PICK A COLOUR", 0
 s_creative: db "CREATIVE ITEMS  (WHEEL OR BAR)", 0
 s_hint:     db "E / ESC: CLOSE", 0
 s_invlabel: db "INVENTORY", 0
+s_chest:    db "CHEST", 0
+s_recipes:  db "RECIPES", 0
+s_beacon:   db "BEACON", 0
+s_bc_on:    db "FULL PYRAMID - PICK ITS POWER", 0
+s_bc_small: db "NEEDS A 4 LAYER PYRAMID FOR A POWER", 0
+s_bc_sky:   db "NEEDS THE SKY ABOVE IT", 0
+s_bc_wait:  db "LOOKING AT THE PYRAMID...", 0
+s_bc_reach: db "WORKS 15 BLOCKS AROUND IT", 0
+s_bc_names: db "REGEN", 0, "STRENGTH", 0, "SPEED", 0
+s_newrec:   db "NEW RECIPES - SEE THE RECIPE BOOK", 0
+s_prev:     db "<", 0
+s_next:     db ">", 0
+s_none:     db "PICK THINGS UP", 0
+s_none2:    db "TO LEARN RECIPES", 0
 
 section .bss
 alignb 4
@@ -81,6 +93,16 @@ tip_buf:    resb 64                 ; second tooltip line (tools)
 dye_in:     resd 1                  ; dye maker: the flower slot
 dye_out:    resd 1                  ; and what it makes
 dye_color:  resd 1                  ; the colour picked (0-15)
+panel_shift: resd 1                 ; the panel moved right (the recipe book open)
+book_seen:  resb 32                 ; items the player has had (a bit each)
+book_known: resb 64                 ; recipes unlocked (a bit per recipe)
+book_open:  resd 1
+book_page:  resd 1
+book_n:     resd 1
+book_list:  resq 512                ; the recipes shown (one per thing made)
+book_ghost: resq 1                  ; a recipe shown faded in the empty grid
+book_tip:   resd 1                  ; the hovered entry, for its tooltip
+page_text:  resb 16
 
 section .text
 
@@ -459,6 +481,7 @@ panel:
     mov eax, [win_w]
     sub eax, r12d
     sar eax, 1
+    add eax, [panel_shift]
     mov [panel_x], eax
     mov eax, [win_h]
     sub eax, r13d
@@ -641,6 +664,8 @@ build_palette:
     jz .n
     cmp ecx, I_EGG_SHEEP
     je .n                           ; listed after the zombie egg instead
+    cmp ecx, I_BEACONCORE
+    je .n                           ; only from wither skeletons
     lea eax, [rcx - I_EGG_WITHER]
     cmp eax, I_EGG_GIANT - I_EGG_WITHER
     jbe .n
@@ -670,11 +695,29 @@ invui_frame:
     call q_hold
     call hud_begin                  ; the HUD drawn before leaves blending off
     mov qword [hover_slot], 0
+    ; the recipe book: survival, the inventory and the crafting table
+    mov dword [panel_shift], 0
+    cmp dword [game_mode], 0
+    jne .noshift
+    mov eax, [state]
+    cmp eax, GS_INVENTORY
+    je .shift
+    cmp eax, GS_CRAFT
+    jne .noshift
+.shift:
+    cmp dword [book_open], 0
+    je .noshift
+    mov dword [panel_shift], BOOK_W / 2 + 4
+.noshift:
     mov eax, [state]
     cmp eax, GS_FURNACE
     je .furnace
     cmp eax, GS_DYE
     je .dyemaker
+    cmp eax, GS_CHEST
+    je .chest
+    cmp eax, GS_BEACON
+    je .beacon
     cmp dword [game_mode], 0
     jne .creative
     cmp eax, GS_CRAFT
@@ -763,6 +806,10 @@ invui_frame:
     call arrow
     mov edi, ROWS_Y
     call inventory_rows
+    mov eax, 304
+    mov ecx, 108
+    call book_button
+    call book_draw
     jmp .done
 
     ; ---- crafting table: 3x3
@@ -796,6 +843,10 @@ invui_frame:
     call label
     mov edi, ROWS_Y
     call inventory_rows
+    mov eax, 14
+    mov ecx, 70
+    call book_button
+    call book_draw
     jmp .done
 
     ; ---- furnace
@@ -946,6 +997,146 @@ invui_frame:
     call inventory_rows
     jmp .done
 
+    ; ---- chest: its 27 slots over the inventory
+.chest:
+    mov edi, PANEL_W
+    mov esi, PANEL_H
+    lea rdx, [s_chest]
+    call panel
+    mov rdi, [cur_chest]
+    test rdi, rdi
+    jz .chest_inv
+    mov eax, 8
+    cvtsi2ss xmm0, eax
+    mov eax, 30
+    cvtsi2ss xmm1, eax
+    mov ecx, 9
+    mov r8d, 3
+    xor esi, esi
+    call slot_grid
+.chest_inv:
+    mov eax, 12
+    mov ecx, 151
+    lea rdi, [s_invlabel]
+    call label
+    mov edi, ROWS_Y
+    call inventory_rows
+    jmp .done
+
+    ; ---- beacon: its state, and a button for each power
+.beacon:
+    mov edi, PANEL_W
+    mov esi, 250
+    lea rdx, [s_beacon]
+    call panel
+    mov edi, [beacon_sel]
+    mov esi, [beacon_sel + 4]
+    mov edx, [beacon_sel + 8]
+    call beacon_status
+    lea rdi, [s_bc_wait]
+    test eax, eax
+    js .bc_say
+    lea rdi, [s_bc_small]
+    cmp eax, 4
+    jb .bc_say
+    lea rdi, [s_bc_sky]
+    test ecx, ecx
+    jz .bc_say
+    lea rdi, [s_bc_on]
+.bc_say:
+    mov eax, 12
+    mov ecx, 36
+    call small
+    mov edi, [beacon_sel]
+    mov esi, [beacon_sel + 4]
+    mov edx, [beacon_sel + 8]
+    call meta_get
+    and eax, 3
+    mov [rsp + 64], eax             ; the power picked
+    xor r12d, r12d
+.bc_btn:
+    imul r13d, r12d, 122
+    add r13d, 12                    ; x
+    mov r14d, 60                    ; y
+    lea eax, [r12 + 1]
+    mov r9d, 0xff373737             ; frame: gold round the one picked
+    cmp eax, [rsp + 64]
+    jne .bc_f
+    mov r9d, 0xff30c0f0
+.bc_f:
+    mov eax, r13d
+    mov ecx, r14d
+    lea edx, [r13 + 106]
+    lea r8d, [r14 + 140]
+    call prect
+    ; inside: lighter under the mouse; a click picks it (again: none)
+    mov r15d, 0xff8b8b8b
+    mov eax, [mouse_x]
+    sub eax, [panel_x]
+    sub eax, r13d
+    cmp eax, 106
+    jae .bc_in
+    mov eax, [mouse_y]
+    sub eax, [panel_y]
+    sub eax, r14d
+    cmp eax, 140
+    jae .bc_in
+    mov r15d, 0xffa8a8a8
+    cmp dword [mouse_click], 1
+    jne .bc_in
+    mov dword [mouse_click], 0
+    lea ecx, [r12 + 1]
+    cmp ecx, [rsp + 64]
+    jne .bc_pick
+    xor ecx, ecx
+.bc_pick:
+    mov [rsp + 64], ecx
+    mov edi, [beacon_sel]
+    mov esi, [beacon_sel + 4]
+    mov edx, [beacon_sel + 8]
+    call meta_set
+    SFX S_CLICK, 80, 100
+.bc_in:
+    lea eax, [r13 + 4]
+    lea ecx, [r14 + 4]
+    lea edx, [r13 + 102]
+    lea r8d, [r14 + 136]
+    mov r9d, r15d
+    call prect
+    lea eax, [r13 + 21]             ; the picture, 8 x 8 pixels
+    add eax, [panel_x]
+    cvtsi2ss xmm0, eax
+    lea eax, [r14 + 14]
+    add eax, [panel_y]
+    cvtsi2ss xmm1, eax
+    mov eax, 8
+    cvtsi2ss xmm2, eax
+    lea edi, [r12 + 1]
+    call effect_icon
+    lea rdi, [s_bc_names]           ; its name (the r12-th of them)
+    mov ecx, r12d
+.bc_nm:
+    test ecx, ecx
+    jz .bc_name
+.bc_skip:
+    inc rdi
+    cmp byte [rdi - 1], 0
+    jne .bc_skip
+    dec ecx
+    jmp .bc_nm
+.bc_name:
+    lea eax, [r13 + 10]
+    lea ecx, [r14 + 100]
+    call small
+    inc r12d
+    cmp r12d, 3
+    jb .bc_btn
+    mov eax, 12
+    mov ecx, 216
+    lea rdi, [s_bc_reach]
+    call small
+    jmp .done
+
     ; ---- creative: every item, then the hotbar
 .creative:
     cmp dword [palette_n], 0
@@ -1017,6 +1208,789 @@ invui_frame:
 .done:
     call cursor_and_tip
     LEAVE_FN
+
+; ---------------------------------------------------------------------------
+; the recipe book
+;
+; Every item the player has had is noted (book_seen); a recipe is unlocked
+; once any of its ingredients has been seen (getting into water unlocks the
+; boat). In survival the inventory and the crafting table have a book
+; button: the book lists the things the unlocked recipes make, green when
+; the inventory holds what they need, red when not. Clicking a green one
+; puts its ingredients in the grid; a red one shows faded in the empty grid.
+
+; void book_clear(void) - a new world: nothing seen
+book_clear:
+    lea rdi, [book_seen]
+    xor eax, eax
+    mov ecx, 32 + 64
+    rep stosb
+    mov qword [book_ghost], 0
+    mov dword [book_page], 0
+    ret
+
+; eax = 1 if item edi unlocks recipe rsi: it is an ingredient (birch or
+; dark oak planks count for oak). Planks and sticks are in nearly
+; everything, so, as in Minecraft, they unlock only what is made of wood
+; alone - planks what has no sticks in it, sticks the rest (the wooden
+; tools): the stone pickaxe comes with cobblestone, the bed with wool. The
+; boat comes with water.
+; locals in registers: r8 match, r9 sticks in it, r10 something not wood
+uses:
+    cmp byte [rsi + 2], I_BOAT
+    je .boat
+    movzx ecx, byte [rsi]
+    movzx eax, byte [rsi + 1]
+    imul ecx, eax
+    xor edx, edx
+    xor r8d, r8d
+    xor r9d, r9d
+    xor r10d, r10d
+.c:
+    cmp edx, ecx
+    jae .judge
+    movzx eax, byte [rsi + 4 + rdx]
+    test eax, eax
+    jz .n
+    cmp eax, I_STICK
+    jne .notstick
+    mov r9d, 1
+    jmp .match
+.notstick:
+    cmp eax, B_PLANKS
+    je .match
+    cmp eax, I_BIRCHPLANKS
+    je .match
+    cmp eax, I_DARKPLANKS
+    je .match
+    mov r10d, 1                     ; not wood
+.match:
+    cmp eax, edi
+    je .yes1
+    cmp eax, B_PLANKS
+    jne .n
+    cmp edi, I_BIRCHPLANKS
+    je .yes1
+    cmp edi, I_DARKPLANKS
+    jne .n
+.yes1:
+    mov r8d, 1
+.n:
+    inc edx
+    jmp .c
+.judge:
+    xor eax, eax
+    test r8d, r8d
+    jz .out
+    cmp edi, I_STICK
+    je .wood
+    cmp edi, B_PLANKS
+    je .planks
+    cmp edi, I_BIRCHPLANKS
+    je .planks
+    cmp edi, I_DARKPLANKS
+    jne .yes
+.planks:
+    test r9d, r9d                   ; planks: not what needs sticks
+    jnz .out
+.wood:
+    test r10d, r10d                 ; wood alone
+    jnz .out
+.yes:
+    mov eax, 1
+.out:
+    ret
+.boat:
+    xor eax, eax
+    cmp edi, B_WATER
+    jne .out
+    mov eax, 1
+    ret
+
+; int unlock_by(int item) - unlock the recipes it is used in: how many new
+unlock_by:
+    push rbx
+    push r12
+    push r13
+    mov r12d, edi
+    xor r13d, r13d                  ; new
+    xor ebx, ebx                    ; recipe number
+    lea rsi, [recipes]
+.r:
+    cmp byte [rsi], 0
+    je .out
+    cmp ebx, 512
+    jae .out
+    bt dword [book_known], ebx
+    jc .next
+    mov edi, r12d
+    call uses
+    test eax, eax
+    jz .next
+    bts dword [book_known], ebx
+    inc r13d
+.next:
+    add rsi, RC_SIZE
+    inc ebx
+    jmp .r
+.out:
+    mov eax, r13d
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; book_note(edi item) - the player has it: unlock what it is used in
+book_note:
+    test edi, edi
+    jz .out
+    and edi, 0xff
+    bts dword [book_seen], edi
+    jc .out
+    sub rsp, 8
+    call unlock_by
+    add rsp, 8
+    test eax, eax
+    jz .out
+    cmp dword [game_mode], 0
+    jne .out
+    sub rsp, 8
+    lea rdi, [s_newrec]
+    call hud_message
+    add rsp, 8
+.out:
+    ret
+
+; void book_rebuild(void) - after loading: unlock again from what was seen
+book_rebuild:
+    push rbx
+    xor ebx, ebx
+.i:
+    bt dword [book_seen], ebx
+    jnc .n
+    mov edi, ebx
+    call unlock_by
+.n:
+    inc ebx
+    cmp ebx, 256
+    jb .i
+    pop rbx
+    ret
+
+; void book_tick(void) - every frame: what is in the inventory, and water
+book_tick:
+    push rbx
+    xor ebx, ebx
+.i:
+    lea rax, [inv]
+    movzx edi, byte [rax + rbx*4]
+    call book_note
+    inc ebx
+    cmp ebx, 36
+    jb .i
+    movzx edi, byte [cursor]
+    call book_note
+    cmp dword [body_water], 0
+    je .out
+    cmp dword [body_lava], 0
+    jne .out
+    mov edi, B_WATER
+    call book_note
+.out:
+    pop rbx
+    ret
+
+; eax = how many of item edi the inventory and the grid hold (planks:
+; all three woods)
+have_count:
+    xor eax, eax
+    lea rsi, [inv]
+    mov ecx, 36
+    call .sum
+    lea rsi, [craft_grid]
+    mov ecx, 9
+    call .sum
+    ret
+.sum:
+    movzx edx, byte [rsi]
+    cmp edx, edi
+    je .add
+    cmp edi, B_PLANKS
+    jne .s
+    cmp edx, I_BIRCHPLANKS
+    je .add
+    cmp edx, I_DARKPLANKS
+    jne .s
+.add:
+    movzx edx, byte [rsi + 1]
+    add eax, edx
+.s:
+    add rsi, 4
+    dec ecx
+    jnz .sum
+    ret
+
+; eax = 1 if the inventory (and grid) hold everything recipe rbx needs
+; locals: [0] cells, [4] cell
+can_make:
+    push r12
+    push r13
+    push r14
+    movzx r12d, byte [rbx]
+    movzx eax, byte [rbx + 1]
+    imul r12d, eax
+    xor r13d, r13d
+.c:
+    cmp r13d, r12d
+    jae .yes
+    movzx edi, byte [rbx + 4 + r13]
+    test edi, edi
+    jz .n
+    ; how many cells want it
+    xor r14d, r14d
+    xor ecx, ecx
+.k:
+    cmp ecx, r12d
+    jae .kd
+    cmp [rbx + 4 + rcx], dil
+    jne .kn
+    inc r14d
+.kn:
+    inc ecx
+    jmp .k
+.kd:
+    call have_count
+    cmp eax, r14d
+    jb .no
+.n:
+    inc r13d
+    jmp .c
+.yes:
+    mov eax, 1
+    jmp .out
+.no:
+    xor eax, eax
+.out:
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+; eax = an item taken out of the inventory for a cell wanting edi (planks:
+; any wood), 0 if there is none
+take_one:
+    lea rsi, [inv]
+    mov ecx, 36
+.f:
+    movzx eax, byte [rsi]
+    cmp eax, edi
+    je .got
+    cmp edi, B_PLANKS
+    jne .n
+    cmp eax, I_BIRCHPLANKS
+    je .got
+    cmp eax, I_DARKPLANKS
+    je .got
+.n:
+    add rsi, 4
+    dec ecx
+    jnz .f
+    xor eax, eax
+    ret
+.got:
+    dec byte [rsi + 1]
+    jnz .left
+    mov dword [rsi], 0
+.left:
+    ret
+
+; void book_fill(rdi recipe) - its ingredients from the inventory into the
+; grid (what was in the grid goes back first)
+book_fill:
+    ENTER_FN 16
+    mov rbx, rdi
+    call craft_return
+    movzx r12d, byte [rbx]          ; w
+    movzx r13d, byte [rbx + 1]      ; h
+    xor r14d, r14d                  ; row
+.r:
+    cmp r14d, r13d
+    jae .done
+    xor r15d, r15d                  ; column
+.c:
+    cmp r15d, r12d
+    jae .rn
+    mov eax, r14d
+    imul eax, r12d
+    add eax, r15d
+    movzx edi, byte [rbx + 4 + rax]
+    test edi, edi
+    jz .cn
+    call take_one
+    test eax, eax
+    jz .cn
+    or eax, 1 << 8
+    lea ecx, [r14 + r14*2]
+    add ecx, r15d
+    lea rdx, [craft_grid]
+    mov [rdx + rcx*4], eax
+.cn:
+    inc r15d
+    jmp .c
+.rn:
+    inc r14d
+    jmp .r
+.done:
+    call craft_update
+    LEAVE_FN
+
+; book_button(eax x, ecx y panel relative) - the green book: opens and
+; closes the recipe book (survival only)
+book_button:
+    cmp dword [game_mode], 0
+    jne .out
+    push rbx
+    push r12
+    push r13
+    mov r12d, eax
+    mov r13d, ecx
+    mov eax, r12d
+    mov ecx, r13d
+    lea edx, [r12 + 28]
+    lea r8d, [r13 + 28]
+    mov r9d, 0xff373737
+    call prect
+    lea eax, [r12 + 2]
+    lea ecx, [r13 + 2]
+    lea edx, [r12 + 26]
+    lea r8d, [r13 + 26]
+    mov r9d, 0xff8b8b8b
+    cmp dword [book_open], 0
+    je .bg
+    mov r9d, 0xffc5c5c5
+.bg:
+    call prect
+    lea eax, [r12 + 6]              ; the book: a green cover, pages, a spine
+    lea ecx, [r13 + 5]
+    lea edx, [r12 + 22]
+    lea r8d, [r13 + 23]
+    mov r9d, 0xff2c7a2c
+    call prect
+    lea eax, [r12 + 9]
+    lea ecx, [r13 + 7]
+    lea edx, [r12 + 21]
+    lea r8d, [r13 + 21]
+    mov r9d, 0xffe8f0f0
+    call prect
+    lea eax, [r12 + 9]
+    lea ecx, [r13 + 7]
+    lea edx, [r12 + 11]
+    lea r8d, [r13 + 21]
+    mov r9d, 0xff1c4c1c
+    call prect
+    ; a click toggles it
+    mov eax, [mouse_x]
+    sub eax, [panel_x]
+    sub eax, r12d
+    cmp eax, 28
+    jae .done
+    mov eax, [mouse_y]
+    sub eax, [panel_y]
+    sub eax, r13d
+    cmp eax, 28
+    jae .done
+    cmp dword [mouse_click], 1
+    jne .done
+    mov dword [mouse_click], 0
+    xor dword [book_open], 1
+.done:
+    pop r13
+    pop r12
+    pop rbx
+.out:
+    ret
+
+; the list of recipes to show: unlocked, fitting the grid, one per thing
+book_build:
+    push rbx
+    push r12
+    push r13
+    xor r12d, r12d                  ; listed
+    xor ebx, ebx
+    lea rsi, [recipes]
+.r:
+    cmp byte [rsi], 0
+    je .out
+    cmp ebx, 512
+    jae .out
+    bt dword [book_known], ebx
+    jnc .n
+    movzx eax, byte [rsi]
+    cmp eax, [craft_size]
+    ja .n
+    movzx eax, byte [rsi + 1]
+    cmp eax, [craft_size]
+    ja .n
+    ; the same thing made already listed?
+    mov al, [rsi + 2]
+    xor ecx, ecx
+.d:
+    cmp ecx, r12d
+    jae .add
+    lea rdx, [book_list]
+    mov rdx, [rdx + rcx*8]
+    cmp [rdx + 2], al
+    je .n
+    inc ecx
+    jmp .d
+.add:
+    lea rdx, [book_list]
+    mov [rdx + r12*8], rsi
+    inc r12d
+.n:
+    add rsi, RC_SIZE
+    inc ebx
+    jmp .r
+.out:
+    mov [book_n], r12d
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; book_draw - the book's panel left of the screen's panel, its page of
+; entries, the page arrows; and the faded recipe in an empty grid
+; locals: [0] entry, [4] x, [8] y, [16] recipe, [24] pages
+book_draw:
+    cmp dword [game_mode], 0
+    jne .ret
+    ENTER_FN 48
+    call book_ghost_draw
+    cmp dword [book_open], 0
+    je .out
+    call book_build
+    ; the panel
+    mov eax, -BOOK_W - 6
+    mov ecx, -2
+    mov edx, -4
+    mov r8d, PANEL_H + 2
+    mov r9d, 0xff000000
+    call prect
+    mov eax, -BOOK_W - 4
+    xor ecx, ecx
+    mov edx, -6
+    mov r8d, PANEL_H
+    mov r9d, 0xffffffff
+    call prect
+    mov eax, -BOOK_W
+    mov ecx, 4
+    mov edx, -6
+    mov r8d, PANEL_H
+    mov r9d, 0xff555555
+    call prect
+    mov eax, -BOOK_W
+    mov ecx, 4
+    mov edx, -10
+    mov r8d, PANEL_H - 4
+    mov r9d, 0xffc6c6c6
+    call prect
+    mov eax, -BOOK_W + 8
+    mov ecx, 10
+    lea rdi, [s_recipes]
+    call label
+    cmp dword [book_n], 0
+    jne .some
+    mov eax, -BOOK_W + 8
+    mov ecx, 60
+    lea rdi, [s_none]
+    call small
+    mov eax, -BOOK_W + 8
+    mov ecx, 76
+    lea rdi, [s_none2]
+    call small
+    jmp .out
+.some:
+    ; pages
+    mov eax, [book_n]
+    add eax, BOOK_COLS * BOOK_ROWS - 1
+    xor edx, edx
+    mov ecx, BOOK_COLS * BOOK_ROWS
+    div ecx
+    mov [rsp + 24], eax
+    mov ecx, [book_page]
+    dec eax
+    cmp ecx, eax
+    cmovg ecx, eax
+    mov [book_page], ecx
+    ; the entries of this page
+    xor r12d, r12d
+.e:
+    cmp r12d, BOOK_COLS * BOOK_ROWS
+    jae .arrows
+    mov eax, [book_page]
+    imul eax, eax, BOOK_COLS * BOOK_ROWS
+    add eax, r12d
+    cmp eax, [book_n]
+    jae .arrows
+    lea rcx, [book_list]
+    mov rbx, [rcx + rax*8]
+    mov eax, r12d
+    xor edx, edx
+    mov ecx, BOOK_COLS
+    div ecx
+    imul edx, edx, SLOT_STEP
+    add edx, -BOOK_W + 4
+    mov r13d, edx                   ; x
+    imul eax, eax, SLOT_STEP
+    add eax, 30
+    mov r14d, eax                   ; y
+    call can_make
+    mov r15d, eax
+    mov r9d, 0xff3030a0             ; red: something missing
+    test r15d, r15d
+    jz .col
+    mov r9d, 0xff38a038             ; green: it can be made
+.col:
+    ; brighter under the mouse
+    mov eax, [mouse_x]
+    sub eax, [panel_x]
+    sub eax, r13d
+    cmp eax, SLOT_PX
+    jae .nh
+    mov eax, [mouse_y]
+    sub eax, [panel_y]
+    sub eax, r14d
+    cmp eax, SLOT_PX
+    jae .nh
+    or r9d, 0x00404040
+    movzx eax, byte [rbx + 2]
+    mov [book_tip], eax
+    lea rax, [book_tip]
+    mov [hover_slot], rax
+    cmp dword [mouse_click], 1
+    jne .nh
+    mov dword [mouse_click], 0
+    mov qword [book_ghost], rbx
+    test r15d, r15d
+    jz .nh
+    mov qword [book_ghost], 0
+    mov rdi, rbx
+    push r9
+    sub rsp, 8
+    call book_fill
+    add rsp, 8
+    pop r9
+.nh:
+    mov eax, r13d
+    mov ecx, r14d
+    lea edx, [r13 + SLOT_PX]
+    lea r8d, [r14 + SLOT_PX]
+    call prect
+    mov eax, r13d
+    add eax, [panel_x]
+    add eax, 2
+    cvtsi2ss xmm0, eax
+    mov eax, r14d
+    add eax, [panel_y]
+    add eax, 2
+    cvtsi2ss xmm1, eax
+    movss xmm2, [f_slot]
+    subss xmm2, [f_four]
+    movzx edi, byte [rbx + 2]
+    movzx eax, byte [rbx + 3]
+    shl eax, 8
+    or edi, eax                     ; what it makes, and how many
+    mov esi, 1
+    call hud_item
+    inc r12d
+    jmp .e
+.arrows:
+    cmp dword [rsp + 24], 1
+    jbe .out
+    ; "<  2/3  >"
+    mov eax, -BOOK_W + 8
+    mov ecx, PANEL_H - 40
+    mov edx, -1
+    call page_arrow
+    mov eax, -40
+    mov ecx, PANEL_H - 40
+    mov edx, 1
+    call page_arrow
+    lea rdi, [page_text]
+    mov eax, [book_page]
+    inc eax
+    call put_num
+    mov byte [rdi], '/'
+    inc rdi
+    mov eax, [rsp + 24]
+    call put_num
+    mov byte [rdi], 0
+    mov eax, -(BOOK_W / 2) - 30
+    mov ecx, PANEL_H - 34
+    lea rdi, [page_text]
+    call label
+.out:
+    LEAVE_FN
+.ret:
+    ret
+
+; put_num(eax 0-99) at rdi, rdi moves on
+put_num:
+    cmp eax, 10
+    jb .one
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    mov eax, edx
+.one:
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    ret
+
+; page_arrow(eax x, ecx y panel relative, edx -1 back / 1 on)
+page_arrow:
+    push rbx
+    push r12
+    push r13
+    mov r12d, eax
+    mov r13d, ecx
+    mov ebx, edx
+    lea edx, [r12 + 28]
+    lea r8d, [r13 + 24]
+    mov r9d, 0xff8b8b8b
+    call prect
+    lea eax, [r12 + 8]
+    lea ecx, [r13 + 4]
+    lea rdi, [s_prev]
+    test ebx, ebx
+    js .t
+    lea rdi, [s_next]
+.t:
+    call label
+    mov eax, [mouse_x]
+    sub eax, [panel_x]
+    sub eax, r12d
+    cmp eax, 28
+    jae .out
+    mov eax, [mouse_y]
+    sub eax, [panel_y]
+    sub eax, r13d
+    cmp eax, 24
+    jae .out
+    cmp dword [mouse_click], 1
+    jne .out
+    mov dword [mouse_click], 0
+    add [book_page], ebx
+    cmp dword [book_page], 0
+    jge .out
+    mov dword [book_page], 0
+.out:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; small(eax x, ecx y panel relative, rdi text): dark grey, scale 1.5
+small:
+    sub rsp, 8
+    add eax, [panel_x]
+    add ecx, [panel_y]
+    cvtsi2ss xmm0, eax
+    cvtsi2ss xmm1, ecx
+    movss xmm2, [f_onehalf]
+    mov esi, 0xff404040
+    call hud_text
+    add rsp, 8
+    ret
+
+; the recipe clicked but not makeable, faded in the grid while it is empty
+book_ghost_draw:
+    mov rax, [book_ghost]
+    test rax, rax
+    jz .ret
+    ENTER_FN 16
+    mov rbx, rax
+    ; only while the grid is empty, and if it fits
+    lea rax, [craft_grid]
+    xor ecx, ecx
+.g:
+    cmp dword [rax + rcx*4], 0
+    jne .gone
+    inc ecx
+    cmp ecx, 9
+    jb .g
+    movzx eax, byte [rbx]
+    cmp eax, [craft_size]
+    ja .gone
+    movzx eax, byte [rbx + 1]
+    cmp eax, [craft_size]
+    ja .gone
+    ; where the grid is on this screen
+    mov dword [rsp], 180
+    mov dword [rsp + 4], 46
+    cmp dword [craft_size], 3
+    jne .at
+    mov dword [rsp], 60
+    mov dword [rsp + 4], 30
+.at:
+    xor r12d, r12d                  ; row
+.r:
+    movzx eax, byte [rbx + 1]
+    cmp r12d, eax
+    jae .out
+    xor r13d, r13d
+.c:
+    movzx eax, byte [rbx]
+    cmp r13d, eax
+    jae .rn
+    imul ecx, r12d, 0
+    movzx ecx, byte [rbx]
+    imul ecx, r12d
+    add ecx, r13d
+    movzx edi, byte [rbx + 4 + rcx]
+    test edi, edi
+    jz .cn
+    imul eax, r13d, SLOT_STEP
+    add eax, [rsp]
+    add eax, [panel_x]
+    add eax, 2
+    mov r14d, eax
+    cvtsi2ss xmm0, eax
+    imul eax, r12d, SLOT_STEP
+    add eax, [rsp + 4]
+    add eax, [panel_y]
+    add eax, 2
+    mov r15d, eax
+    cvtsi2ss xmm1, eax
+    movss xmm2, [f_slot]
+    subss xmm2, [f_four]
+    or edi, 1 << 8
+    xor esi, esi
+    call hud_item
+    cvtsi2ss xmm0, r14d             ; faded: grey over it
+    cvtsi2ss xmm1, r15d
+    lea eax, [r14 + 32]
+    cvtsi2ss xmm2, eax
+    lea eax, [r15 + 32]
+    cvtsi2ss xmm3, eax
+    mov edi, 0xa08b8b8b
+    call hud_rect
+.cn:
+    inc r13d
+    jmp .c
+.rn:
+    inc r12d
+    jmp .r
+.gone:
+    mov qword [book_ghost], 0
+.out:
+    LEAVE_FN
+.ret:
+    ret
 
 ; q_target -> rax: the stack Q throws from: the mouse's, else the slot
 ; under the mouse (not an output or the creative palette); 0 if none

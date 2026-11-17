@@ -1,30 +1,21 @@
-; win32.asm - the Windows (XP x64) window: a borderless window covering
-; the screen with an OpenGL context, the message loop, mouse capture for
-; looking around, and keys turned into the X11 keysyms the game uses (so
-; the key bindings and their names are the same as on Linux).
-;
-; The game calls in here the System V way (main.asm); everything here
-; calls Windows the Windows way. The window procedure is called by
-; Windows, so it keeps the registers Windows expects kept (rbx, rbp, rdi,
-; rsi, r12-r15, xmm6-15) before calling into the game.
-
 %include "common.inc"
 
 %ifdef VOXASM_WIN
 
 global start, init_window, poll_events, swap_buffers, close_window
-global plat_warp, plat_grab, plat_release
+global plat_warp, plat_grab, plat_release, snd_open, snd_pump
 
 extern main, win_imports_init, wgl_create, wgl_make_current, wgl_delete
 extern ev_key_down, ev_key_up, ev_button_down, ev_button_up, ev_motion
 extern ev_resize, ev_close, ev_focus_out, write
-extern win_w, win_h, grabbed, mouse_x, mouse_y
+extern win_w, win_h, grabbed, mouse_x, mouse_y, sound_mix, dt
+extern __imp_LoadLibraryA, __imp_GetProcAddress
 
 extern __imp_GetModuleHandleA, __imp_ExitProcess
 extern __imp_RegisterClassExA, __imp_CreateWindowExA, __imp_DefWindowProcA
 extern __imp_PeekMessageA, __imp_DispatchMessageA, __imp_GetDC
 extern __imp_ReleaseDC, __imp_DestroyWindow, __imp_ShowWindow
-extern __imp_SetForegroundWindow, __imp_SetFocus, __imp_LoadCursorA
+extern __imp_SetForegroundWindow, __imp_SetFocus, __imp_LoadCursorA, __imp_LoadIconA
 extern __imp_SetCursor, __imp_SetCursorPos, __imp_ClientToScreen
 extern __imp_ClipCursor, __imp_GetWindowRect, __imp_SetCapture
 extern __imp_ReleaseCapture, __imp_GetSystemMetrics, __imp_MessageBoxA
@@ -68,6 +59,17 @@ s_t_window: db "making the window", 10, 0
 s_t_gl:     db "window and OpenGL ready", 10, 0
 align 8
 argv:       dq s_prog, 0
+; sound: winmm.dll is found when the game starts (no sound without it)
+s_winmm:    db "winmm.dll", 0
+s_wopen:    db "waveOutOpen", 0
+s_wprep:    db "waveOutPrepareHeader", 0
+s_wwrite:   db "waveOutWrite", 0
+s_tperiod:  db "timeBeginPeriod", 0
+align 4
+wave_fmt:   dw 1, 1                 ; PCM, one channel
+            dd 22050, 44100         ; samples, bytes a second
+            dw 2, 16, 0             ; bytes a sample, bits, no extra
+f_bufs:     dd 65.0                 ; buffers a second of frame time, and half
 
 ; virtual key -> X11 keysym (0 = not used), for keys 0x00-0xDF
 vk_map:
@@ -107,6 +109,19 @@ pfd:        resb 40                 ; PIXELFORMATDESCRIPTOR
 msg:        resb 48                 ; MSG
 rect:       resd 4
 point:      resd 2
+; sound out: SND_BUFS buffers of SND_N samples go round (23 ms each)
+SND_BUFS    equ 12
+SND_N       equ 512
+WHDR_SIZE   equ 48                  ; WAVEHDR: +0 data, +8 bytes, +24 flags
+WHDR_INQUEUE equ 0x10
+alignb 8
+hwo:        resq 1
+p_wprep:    resq 1
+p_wwrite:   resq 1
+snd_ok:     resd 1
+alignb 8
+wave_hdrs:  resb SND_BUFS * WHDR_SIZE
+wave_bufs:  resw SND_BUFS * SND_N
 
 section .text
 
@@ -144,6 +159,133 @@ trace_line:
     jmp write
 
 ; ---------------------------------------------------------------------------
+; void snd_open(void) - open the sound device (22050 Hz, 16 bit, mono).
+; Without one (or without winmm.dll) the game is silent. Also asks Windows
+; for 1 ms timer steps, so the frame limit's short sleeps are that short.
+; locals: [48] winmm, [56] rbx, [64] r12
+snd_open:
+    WIN_ENTER 48
+    mov [rsp + 56], rbx
+    mov [rsp + 64], r12
+    lea rcx, [s_winmm]
+    call [rel __imp_LoadLibraryA]
+    test rax, rax
+    jz .out
+    mov [rsp + 48], rax
+    mov rcx, rax
+    lea rdx, [s_tperiod]
+    call [rel __imp_GetProcAddress]
+    test rax, rax
+    jz .wave
+    mov ecx, 1
+    call rax
+.wave:
+    mov rcx, [rsp + 48]
+    lea rdx, [s_wprep]
+    call [rel __imp_GetProcAddress]
+    mov [p_wprep], rax
+    test rax, rax
+    jz .out
+    mov rcx, [rsp + 48]
+    lea rdx, [s_wwrite]
+    call [rel __imp_GetProcAddress]
+    mov [p_wwrite], rax
+    test rax, rax
+    jz .out
+    mov rcx, [rsp + 48]
+    lea rdx, [s_wopen]
+    call [rel __imp_GetProcAddress]
+    test rax, rax
+    jz .out
+    lea rcx, [hwo]
+    mov edx, -1                     ; WAVE_MAPPER: the default device
+    lea r8, [wave_fmt]
+    xor r9d, r9d
+    mov qword [rsp + 32], 0
+    mov qword [rsp + 40], 0         ; no callback: snd_pump looks every frame
+    call rax
+    test eax, eax
+    jnz .out
+    lea rbx, [wave_hdrs]
+    lea r12, [wave_bufs]
+.hdr:
+    mov [rbx], r12
+    mov dword [rbx + 8], SND_N * 2
+    mov rcx, [hwo]
+    mov rdx, rbx
+    mov r8d, WHDR_SIZE
+    call [p_wprep]
+    add rbx, WHDR_SIZE
+    add r12, SND_N * 2
+    lea rax, [wave_hdrs + SND_BUFS * WHDR_SIZE]
+    cmp rbx, rax
+    jb .hdr
+    mov dword [snd_ok], 1
+.out:
+    mov rbx, [rsp + 56]
+    mov r12, [rsp + 64]
+    WIN_LEAVE
+
+; void snd_pump(void) - every frame: keep enough sound queued to last
+; until the next one (three buffers and one and a half frames' worth), by
+; mixing into the buffers the device has finished with
+; locals: [32] rbx, [40] r12, [48] r13
+snd_pump:
+    cmp dword [snd_ok], 0
+    jne .on
+    ret
+.on:
+    WIN_ENTER 32
+    mov [rsp + 32], rbx
+    mov [rsp + 40], r12
+    mov [rsp + 48], r13
+    ; how many are waiting to be played
+    lea rbx, [wave_hdrs]
+    xor r12d, r12d
+    xor ecx, ecx
+.count:
+    test dword [rbx + 24], WHDR_INQUEUE
+    jz .c1
+    inc r12d
+.c1:
+    add rbx, WHDR_SIZE
+    inc ecx
+    cmp ecx, SND_BUFS
+    jb .count
+    movss xmm0, [dt]
+    mulss xmm0, [f_bufs]
+    cvttss2si r13d, xmm0
+    add r13d, 3
+    cmp r13d, SND_BUFS
+    jle .fill
+    mov r13d, SND_BUFS
+.fill:
+    lea rbx, [wave_hdrs]
+.f:
+    cmp r12d, r13d
+    jge .out
+    test dword [rbx + 24], WHDR_INQUEUE
+    jnz .next
+    mov rdi, [rbx]
+    mov esi, SND_N
+    call sound_mix                  ; (the game's own: System V)
+    mov rcx, [hwo]
+    mov rdx, rbx
+    mov r8d, WHDR_SIZE
+    call [p_wwrite]
+    inc r12d
+.next:
+    add rbx, WHDR_SIZE
+    lea rax, [wave_hdrs + SND_BUFS * WHDR_SIZE]
+    cmp rbx, rax
+    jb .f
+.out:
+    mov rbx, [rsp + 32]
+    mov r12, [rsp + 40]
+    mov r13, [rsp + 48]
+    WIN_LEAVE
+
+; ---------------------------------------------------------------------------
 ; the program starts here: find the DLL functions, run the game
 start:
     sub rsp, 40
@@ -166,7 +308,12 @@ init_window:
     mov edx, IDC_ARROW
     call [rel __imp_LoadCursorA]
     mov [arrow], rax
+    mov rcx, [hinst]
+    mov edx, 1                      ; the icon in assets/voxasm.rc
+    call [rel __imp_LoadIconA]
     lea rcx, [wndclass]
+    mov [rcx + 32], rax             ; hIcon
+    mov [rcx + 72], rax             ; hIconSm
     mov dword [rcx], 80             ; cbSize
     mov dword [rcx + 4], CS_OWNDC
     lea rax, [wndproc]

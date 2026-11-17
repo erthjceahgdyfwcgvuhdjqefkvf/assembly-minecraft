@@ -1,22 +1,14 @@
-; boat.asm - boats: placed from the item, ridden with the movement keys.
-;
-; A boat floats with its bottom 0.3 under the water surface, falls on land
-; and slides to a stop there. Right-click a boat to get in: forward / back
-; move it the way the player looks (fast on water, slow on land), the
-; sneak key gets out onto the nearest bank (or on top). Three quick hits
-; break it and it drops as an item (creative: one hit, no drop). Boats are
-; saved with the world (save.asm copies the array).
-
 %include "common.inc"
 
 global boats, riding, boat_clear, boat_place, boat_use, boat_attack
-global boat_update, draw_boats
+global boat_update, draw_boats, boat_spawn
 
 extern pos, yaw, pitch, syaw, cyaw, keys, dt, state, game_mode
+extern eye_h
 extern bind_fwd, bind_back, bind_down
 extern world_get, block_flags, solid_at, ent_spawn, target_hit, target
 extern cur_pcx, cur_pcz, fig_parts, fig_tint, light_get, light_curve, sunlight
-extern dimension
+extern dimension, cart_move
 extern glPushMatrix, glPopMatrix, glTranslatef, glRotatef, glScalef
 extern glEnable, glDisable
 
@@ -31,6 +23,7 @@ BT_VZ       equ 24
 BT_YAW      equ 28                  ; degrees, 0 = front toward +z
 BT_DMG      equ 32                  ; hits taken (fades)
 BT_HURT     equ 36                  ; red flash left
+BT_KIND     equ 40                  ; 0 a boat, 1 a minecart (cart.asm moves it)
 BT_SIZE     equ 48
 GL_CULL_FACE equ 0x0B44
 GL_TEXTURE_2D equ 0x0DE1
@@ -95,6 +88,17 @@ m_boat:
     FPART -20.0,  5.0,  -1.5, -17.0,  6.5,   1.5, 150, 112,  66   ; blades
     FPART  17.0,  5.0,  -1.5,  20.0,  6.5,   1.5, 150, 112,  66
 M_BOAT_N equ ($ - m_boat) / 32
+m_cart:
+    FPART  -8.0,  2.0, -10.0,   8.0,  4.0,  10.0,  92,  94, 102   ; floor
+    FPART  -8.0,  4.0, -10.0,  -6.0, 12.0,  10.0, 132, 134, 142   ; sides
+    FPART   6.0,  4.0, -10.0,   8.0, 12.0,  10.0, 132, 134, 142
+    FPART  -6.0,  4.0,   8.0,   6.0, 12.0,  10.0, 118, 120, 128   ; ends
+    FPART  -6.0,  4.0, -10.0,   6.0, 12.0,  -8.0, 118, 120, 128
+    FPART  -9.0,  0.0,  -8.0,  -7.0,  4.0,  -4.0,  52,  52,  58   ; wheels
+    FPART   7.0,  0.0,  -8.0,   9.0,  4.0,  -4.0,  52,  52,  58
+    FPART  -9.0,  0.0,   4.0,  -7.0,  4.0,   8.0,  52,  52,  58
+    FPART   7.0,  0.0,   4.0,   9.0,  4.0,   8.0,  52,  52,  58
+M_CART_N equ ($ - m_cart) / 32
 
 section .bss
 alignb 16
@@ -146,7 +150,7 @@ view_ray:
     movss xmm0, [pos]
     movss [ray], xmm0
     movss xmm0, [pos + 4]
-    addss xmm0, [f_eye]
+    addss xmm0, [eye_h]
     movss [ray + 4], xmm0
     movss xmm0, [pos + 8]
     movss [ray + 8], xmm0
@@ -325,6 +329,10 @@ boat_attack:
     movss xmm4, [f_x5]
     xorps xmm5, xmm5
     mov edi, I_BOAT | (1 << 8)
+    cmp dword [rbx + BT_KIND], 0
+    je .drop
+    mov edi, I_CART | (1 << 8)
+.drop:
     call ent_spawn
 .gone:
     mov dword [rbx + BT_USED], 0
@@ -428,6 +436,32 @@ boat_place:
 .no:
     xor eax, eax
     LEAVE_FN
+
+; rax boat_spawn(xmm0 x, xmm1 y, xmm2 z, edi kind) - a new boat or minecart
+; there; 0 if there are too many
+boat_spawn:
+    lea rax, [boats]
+    xor ecx, ecx
+.f:
+    cmp dword [rax + BT_USED], 0
+    je .got
+    add rax, BT_SIZE
+    inc ecx
+    cmp ecx, MAX_BOATS
+    jb .f
+    xor eax, eax
+    ret
+.got:
+    xorps xmm3, xmm3
+    movups [rax], xmm3
+    movups [rax + 16], xmm3
+    movups [rax + 32], xmm3
+    mov dword [rax + BT_USED], 1
+    movss [rax + BT_X], xmm0
+    movss [rax + BT_Y], xmm1
+    movss [rax + BT_Z], xmm2
+    mov [rax + BT_KIND], edi
+    ret
 
 ; look_yaw -> xmm0: the model yaw (degrees) facing the way the player looks
 look_yaw:
@@ -619,6 +653,8 @@ boat_update:
     add rbx, rax
     cmp dword [rbx + BT_USED], 0
     je .next
+    cmp dword [rbx + BT_KIND], 0
+    jne .cart
     ; water at the waterline?
     movss xmm0, [rbx + BT_X]
     movss xmm1, [rbx + BT_Y]
@@ -808,6 +844,39 @@ boat_update:
 .zok:
     mov eax, [rsp + 12]
     mov [rbx + BT_Z], eax
+    jmp .fade
+.cart:
+    ; a minecart: the rider pushes with forward / back, sneak gets out
+    xor eax, eax
+    lea ecx, [r12 + 1]
+    cmp ecx, [riding]
+    jne .cnotr
+    inc eax
+.cnotr:
+    mov [rsp + 4], eax
+    xor esi, esi
+    test eax, eax
+    jz .cmove
+    cmp dword [state], GS_GAME
+    jne .cmove
+    lea r13, [keys]
+    mov eax, [bind_down]
+    cmp byte [r13 + rax], 0
+    je .cpush
+    call get_out
+    mov dword [rsp + 4], 0
+    xor esi, esi
+    jmp .cmove
+.cpush:
+    mov eax, [bind_fwd]
+    movzx esi, byte [r13 + rax]
+    mov ecx, [bind_back]
+    movzx ecx, byte [r13 + rcx]
+    sub esi, ecx
+.cmove:
+    mov rdi, rbx
+    mov edx, [rsp + 4]
+    call cart_move
 .fade:
     movss xmm0, [rbx + BT_HURT]
     subss xmm0, [dt]
@@ -936,6 +1005,11 @@ draw_boats:
     call glScalef PLT
     lea rdi, [m_boat]
     mov esi, M_BOAT_N
+    cmp dword [rbx + BT_KIND], 0
+    je .model
+    lea rdi, [m_cart]
+    mov esi, M_CART_N
+.model:
     call fig_parts
     call glPopMatrix PLT
 .next:

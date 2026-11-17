@@ -1,16 +1,10 @@
-; ui.asm - menus: home screen, new world, settings, pause, death.
-;
-; Immediate-mode UI: every frame each screen draws its buttons, and a
-; button reports the mouse click that landed on it this frame (1 = left,
-; 3 = right). Settings step forward on left click and back on right click.
-
 %include "common.inc"
 
 global ui_frame, ui_button, delete_pending
 
 extern state, settings_return, mouse_x, mouse_y, mouse_click, running
 extern world_active, seed, win_w, win_h
-extern start_world, end_world, resume_game, respawn
+extern start_world, end_world, resume_game, respawn, sound_keep
 extern hud_begin, hud_rect, hud_text, hud_text_center, hud_tile, text_width
 extern settings_label, settings_change, settings_count
 extern snprintf, mapgen_flat, worlds_scan, world_info, load_world
@@ -36,15 +30,15 @@ f_305:      dd 305.0
 f_310:      dd 310.0
 f_btn_h:    dd 38.0
 f_btn_gap:  dd 46.0
-f_set_h:    dd 30.0
-f_set_gap:  dd 34.0
+f_set_h:    dd 28.0
+f_set_gap:  dd 31.0
 f_y_title:  dd 0.14
 f_y_sub:    dd 0.30
 f_y_menu:   dd 0.40
 f_24:       dd 24.0
 f_60:       dd 60.0
-f_hint_y:   dd 330.0
-f_done_y:   dd 352.0
+f_hint_y:   dd 340.0
+f_done_y:   dd 358.0
 f_1_5:      dd 1.5
 f_5:        dd 5.0
 f_del_x:    dd 264.0                ; DEL button: right of the 520-wide row
@@ -190,6 +184,7 @@ ui_button:
     test eax, eax
     jz .out
     mov dword [mouse_click], 0
+    SFX S_CLICK, 100, 100
 .out:
     LEAVE_FN
 
@@ -573,10 +568,10 @@ scr_settings:
     lea rsi, [label_buf]
     mov edx, 96
     call settings_label
-    ; column = i / 8, row = i % 8
+    ; column = i / 9, row = i % 9
     mov eax, ebx
     xor edx, edx
-    mov ecx, 8
+    mov ecx, 9
     div ecx
     mov r12d, eax
     mov r13d, edx

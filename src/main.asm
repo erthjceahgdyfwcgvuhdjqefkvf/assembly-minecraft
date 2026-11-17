@@ -1,15 +1,8 @@
-; main.asm - VoxASM entry point: X11 window, event handling, screens,
-; game loop, chunk streaming with far-terrain detail levels.
-;
-; Screens: home -> new world (survival / creative) -> game, with settings
-; and pause menus (ui.asm). The world is drawn by render.asm, the player
-; simulated by player.asm, terrain made on a second core by worker.asm.
-
 %include "common.inc"
 
 %ifdef VOXASM_TEST
 ; headless test build (tests/test_game.c drives the frame functions)
-global init_spiral, update_chunks, apply_settings, game_frame
+global init_spiral, update_chunks, apply_settings, game_frame, ev_key_down, ev_key_up
 %elifdef VOXASM_WIN
 global main, ev_key_down, ev_key_up, ev_button_down, ev_button_up
 global ev_motion, ev_resize, ev_close, ev_focus_out
@@ -21,7 +14,7 @@ global mouse_wheel, menu_lmb
 global world_active, seed, win_w, win_h, keys, dt, acc_x, acc_y, grabbed
 global lmb_down, warp_center, cur_pcx, cur_pcz, spiral, spiral_n, fps
 global t_now, errmsg, start_world, end_world, resume_game, respawn, threaded
-global world_time, sunlight, tod, new_world_slot, load_world, spiral_r2
+global world_time, sunlight, tod, new_world_slot, load_world, spiral_r2, cmds_ok
 
 ; libc
 extern exit, clock_gettime, strtol, strcmp, time, printf, write, fflush, usleep
@@ -47,6 +40,7 @@ extern set_window
 extern init_gl, rebuild_atlas, apply_vsync, renderer_reset, upload_slot
 extern render_world, draw_hud, ui_frame
 extern world_find, world_gen_sync, world_slot_of, chunk_info
+extern world_gen_begin, world_gen_step, gen_active
 extern mesh_chunk, mesh_set_leaves_opaque
 extern worker_start, worker_submit, worker_collect, worker_wait_idle
 extern worker_set_seed
@@ -63,11 +57,20 @@ extern horizon_update, horizon_reset, horizon_remesh
 extern furnace_tick, ent_update, ent_clear, furnaces
 extern invui_frame, invui_open, invui_close, invui_qpress
 extern boat_update, boat_clear, riding, tnt_update, tnt_clear
+extern wire_update, wire_reset, wire_new, wire_load, book_tick
+extern weather_update, weather_set
+extern dragon_update, dragon_new, dragon_enter
 extern fire_update, fire_clear, portal_update, dimension, save_all
 extern beacon_update, beacon_clear
+extern sound_init, set_fpscap, fx_update, fx_clear
+%ifdef VOXASM_WIN
+extern snd_open, snd_pump
+%endif
 global dim_enter
 extern bind_inv, bind_drop, bind_fly, controls_key, delete_pending
 extern light_chunk, mapgen_base_height, mapgen_flat, set_daycycle
+extern game_mode, hud_message, player_set_mode
+global chat_open, chat_len, chat_buf
 
 MAX_SPIRAL      equ 2048
 NETHER_RANGE    equ 4               ; view range (chunks) in the nether
@@ -106,6 +109,7 @@ d_tick:     dq 0.2                  ; seconds between water steps
 f_dtmax:    dd 0.05
 f_zero:     dd 0.0
 f_genbudget:  dd 0.012              ; single-threaded world gen per frame (s)
+f_genfar:     dd 0.005              ; the same when only far chunks are missing
 f_meshbudget: dd 0.008              ; meshing per frame (s)
 f_lightbudget: dd 0.006             ; relighting per frame (s)
 f_daylen:   dd 1200.0               ; seconds per day (20 minutes)
@@ -118,6 +122,8 @@ f_day_mul:  dd 1.4
 f_morning:  dd 60.0                 ; new worlds start a minute after sunrise
 f_noon:     dd 0.25
 d_autosave: dq 120.0
+d_frame:    dq 0.0333333, 0.0166667 ; FPS LIMIT 30, 60: seconds a frame
+d_1e6:      dq 1.0e6
 window_sizes: dd 640, 400, 800, 500, 1024, 640, 1280, 800
 glx_attr24: dd 4, 5, 12, 24, 0      ; GLX_RGBA, GLX_DOUBLEBUFFER, DEPTH 24
 glx_attr16: dd 4, 5, 12, 16, 0
@@ -169,11 +175,16 @@ lmb_down:   resd 1
 acc_x:      resd 1
 acc_y:      resd 1
 dt:         resd 1
+gen_budget: resd 1                  ; this frame's world gen time (s)
 cur_pcx:    resd 1
 cur_pcz:    resd 1
 frames:     resd 1
 fps:        resd 1
 keys:       resb 512
+chat_open:  resd 1                  ; the command box (/) is open
+cmds_ok:    resd 1                  ; commands allowed: the world was made in creative
+chat_len:   resd 1
+chat_buf:   resb 48                 ; what is typed, with room for the cursor
 alignb 4
 spiral:     resd MAX_SPIRAL * 2         ; dx, dz
 spiral_n:   resd 1
@@ -305,6 +316,10 @@ main:
     mov edi, [set_leaves]
     call mesh_set_leaves_opaque
     call init_spiral
+    call sound_init
+%ifdef VOXASM_WIN
+    call snd_open
+%endif
     mov edi, [seed]
     call worker_start
     mov [threaded], eax
@@ -336,12 +351,32 @@ main:
     cmp dword [running], 0
     je .quit
     call game_frame
+%ifdef VOXASM_WIN
+    call snd_pump
+%endif
     call swap_buffers
     call update_fps
     ; menus need no more than about 60 frames a second: let the CPU rest
     cmp dword [world_active], 0
-    jne .loop
+    jne .cap
     mov edi, 15000
+    call usleep PLT
+    jmp .loop
+.cap:
+    ; the frame limit: sleep away what is left of the frame's time
+    mov eax, [set_fpscap]
+    test eax, eax
+    jz .loop
+    call now
+    subsd xmm0, [t_last]            ; this frame so far (seconds)
+    mov eax, [set_fpscap]
+    lea rcx, [d_frame]
+    movsd xmm1, [rcx + rax*8 - 8]
+    subsd xmm1, xmm0
+    mulsd xmm1, [d_1e6]
+    cvttsd2si edi, xmm1
+    cmp edi, 1000
+    jl .loop
     call usleep PLT
     jmp .loop
 
@@ -375,21 +410,29 @@ game_frame:
     cmp dword [world_active], 0
     je .menu
     call day_clock
+    call weather_update
     mov eax, [state]
     cmp eax, GS_GAME
     je .play
     cmp eax, GS_INVENTORY
     jb .stream
     cmp eax, GS_DYE
+    jbe .isitem1
+    cmp eax, GS_CHEST
+    jb .stream
+    cmp eax, GS_BEACON
     ja .stream
+.isitem1:
     ; an inventory screen is open: the world keeps going around the player
     call update_player
     call update_survival
+    call book_tick
     jmp .world
 .play:
     call update_look
     call update_player
     call update_survival
+    call book_tick
     call update_target
     call update_digging
     call portal_update
@@ -397,11 +440,14 @@ game_frame:
     movss xmm0, [dt]
     call furnace_tick
     call ent_update
+    call fx_update
     call mob_update
     call boat_update
+    call wire_update
     call tnt_update
     call fire_update
     call beacon_update
+    call dragon_update
     call crop_tick
     ; water a few times per second
     movsd xmm0, [t_now]
@@ -441,7 +487,12 @@ game_frame:
     cmp eax, GS_INVENTORY
     jb .ui
     cmp eax, GS_DYE
+    jbe .isitem2
+    cmp eax, GS_CHEST
+    jb .ui
+    cmp eax, GS_BEACON
     ja .ui
+.isitem2:
     call draw_hud
     call invui_frame
     jmp .out
@@ -586,6 +637,7 @@ world_reset:
     xor eax, eax
     mov ecx, NUM_SLOTS * CI_SIZE
     rep stosb
+    mov dword [gen_active], 0
     call liquid_reset
     LEAVE_FN
 
@@ -671,12 +723,15 @@ fresh_world_state:
     mov dword [knock_z], 0
     mov dword [riding], 0
     call tnt_clear
+    call wire_reset
     call fire_clear
     call beacon_clear
+    call fx_clear
     call mob_clear
     call world_reset
     call horizon_reset
     call ent_clear
+    call dragon_enter               ; (on the island: the dragon, unless dead)
     mov edi, [seed]
     call worker_set_seed
     call now
@@ -713,6 +768,8 @@ start_world:
     call fresh_world_state
     mov dword [spawn_bed], 0        ; a new world: no bed yet
     call boat_clear
+    call wire_new
+    call dragon_new
     lea rdi, [furnaces]
     xor eax, eax
     mov ecx, FURNACE_BYTES
@@ -728,6 +785,10 @@ start_world:
     mov edi, r12d
     call player_new
     call player_spawn
+    xor eax, eax
+    cmp r12d, 1
+    sete al
+    mov [cmds_ok], eax              ; made in creative: commands from now on
     mov eax, [f_morning]
     mov [world_time], eax
     call save_meta
@@ -745,6 +806,7 @@ load_world:
     call load_meta
     test eax, eax
     jz .out
+    call wire_load
     call fresh_world_state
     call init_spiral                ; (the nether sees less far)
     movss xmm0, [pos]
@@ -1109,6 +1171,16 @@ ev_key_down:
     call keyidx
     test ecx, ecx
     js .out
+    cmp dword [chat_open], 0
+    je .nochat
+    cmp dword [state], GS_GAME
+    jne .chat_stale
+    mov edi, ebx                    ; typing: nothing else gets the key
+    call chat_key
+    jmp .out
+.chat_stale:
+    mov dword [chat_open], 0
+.nochat:
     lea rdx, [keys]
     mov byte [rdx + rcx], 1
     mov eax, [state]
@@ -1123,7 +1195,12 @@ ev_key_down:
     cmp eax, GS_INVENTORY
     jb .k_menu
     cmp eax, GS_DYE
+    jbe .isitem3
+    cmp eax, GS_CHEST
+    jb .k_menu
+    cmp eax, GS_BEACON
     ja .k_menu
+.isitem3:
     ; inventory screens close with the inventory key or Esc; the drop
     ; key throws from the stack on the mouse
     cmp ecx, [bind_drop]
@@ -1175,6 +1252,8 @@ ev_key_down:
     je .inventory
     cmp ecx, [bind_drop]
     je .drop
+    cmp ebx, '/'
+    je .chat
     cmp ebx, '1'
     jb .out
     cmp ebx, '9'
@@ -1185,6 +1264,11 @@ ev_key_down:
 .pause:
     mov dword [state], GS_PAUSE
     call release_mouse
+    jmp .out
+.chat:
+    cmp dword [cmds_ok], 0          ; only in worlds made in creative
+    je .out
+    call chat_start
     jmp .out
 .fly:
     call toggle_fly
@@ -1198,6 +1282,164 @@ ev_key_down:
     call drop_selected
 .out:
     LEAVE_FN
+
+; the command box: / opens it (creative only), Enter runs, Esc closes
+chat_start:
+    mov dword [chat_open], 1
+    mov dword [chat_len], 1
+    mov byte [chat_buf], '/'
+    lea rdi, [keys]                 ; nothing stays held while typing
+    xor eax, eax
+    mov ecx, 512
+    rep stosb
+    mov dword [lmb_down], 0
+    ret
+
+; void chat_key(int keysym)
+chat_key:
+    ENTER_FN 0
+    mov eax, edi
+    cmp eax, XK_Escape
+    je .close
+    cmp eax, 0xff0d
+    je .enter
+    cmp eax, 0xff08
+    je .back
+    cmp eax, 0x20
+    jb .out
+    cmp eax, 0x7e
+    ja .out
+    mov ecx, [chat_len]
+    cmp ecx, 40
+    jae .out
+    lea rdx, [chat_buf]
+    mov [rdx + rcx], al
+    inc ecx
+    mov [chat_len], ecx
+    jmp .out
+.back:
+    cmp dword [chat_len], 0
+    je .out
+    dec dword [chat_len]
+    jmp .out
+.enter:
+    lea rax, [chat_buf]
+    mov ecx, [chat_len]
+    mov byte [rax + rcx], 0
+    mov rdi, rax
+    cmp byte [rdi], '/'
+    jne .run
+    inc rdi
+.run:
+    call chat_run
+.close:
+    mov dword [chat_open], 0
+.out:
+    LEAVE_FN
+
+; void chat_run(const char *line) - "set day" or "set night"
+chat_run:
+    ENTER_FN 0
+    mov rbx, rdi
+    ; (the box only opens where commands are allowed: checked again here)
+    cmp dword [cmds_ok], 0
+    jne .allowed
+    lea rdi, [msg_nocmds]
+    call hud_message
+    jmp .out
+.allowed:
+    mov rdi, rbx
+    lea rsi, [cmd_day]
+    call strcmp PLT
+    test eax, eax
+    jnz .notday
+    mov eax, [f_time_day]
+    jmp .set
+.notday:
+    mov rdi, rbx
+    lea rsi, [cmd_night]
+    call strcmp PLT
+    test eax, eax
+    jnz .notnight
+    mov eax, [f_time_night]
+.set:
+    cmp dword [set_daycycle], 0
+    je .nocycle
+    mov [world_time], eax
+    lea rdi, [msg_timeset]
+    call hud_message
+    jmp .out
+.nocycle:
+    lea rdi, [msg_nocycle]
+    call hud_message
+    jmp .out
+.notnight:
+    mov rdi, rbx
+    lea rsi, [cmd_rain]
+    call strcmp PLT
+    mov edi, 1
+    test eax, eax
+    jz .weather
+    mov rdi, rbx
+    lea rsi, [cmd_clear]
+    call strcmp PLT
+    test eax, eax
+    jnz .notclear
+    xor edi, edi
+.weather:
+    call weather_set
+    lea rdi, [msg_weather]
+    call hud_message
+    jmp .out
+.notclear:
+    mov rdi, rbx
+    lea rsi, [cmd_creative]
+    call strcmp PLT
+    mov edi, 1
+    lea r12, [msg_creative]
+    test eax, eax
+    jz .mode
+    mov rdi, rbx
+    lea rsi, [cmd_survival]
+    call strcmp PLT
+    test eax, eax
+    jnz .unknown
+    xor edi, edi
+    lea r12, [msg_survival]
+.mode:
+    call player_set_mode
+    test eax, eax
+    jnz .modeset
+    lea r12, [msg_already]
+.modeset:
+    mov rdi, r12
+    call hud_message
+    jmp .out
+.unknown:
+    lea rdi, [msg_unknown]
+    call hud_message
+.out:
+    LEAVE_FN
+
+section .rodata
+cmd_day:        db "set day", 0
+cmd_night:      db "set night", 0
+cmd_rain:       db "set rain", 0
+cmd_clear:      db "set clear", 0
+cmd_creative:   db "set creative", 0
+cmd_survival:   db "set survival", 0
+msg_creative:   db "GAME MODE: CREATIVE", 0
+msg_survival:   db "GAME MODE: SURVIVAL", 0
+msg_already:    db "ALREADY IN THAT GAME MODE", 0
+msg_nocmds:     db "COMMANDS ARE OFF IN THIS WORLD", 0
+msg_weather:    db "WEATHER SET", 0
+msg_timeset:    db "TIME SET", 0
+msg_nocycle:    db "TURN ON THE DAY CYCLE IN SETTINGS", 0
+msg_unknown:    db "UNKNOWN COMMAND - SEE THE LIST ABOVE", 0
+align 4
+f_time_day:     dd 60.0             ; early morning
+f_time_night:   dd 840.0            ; just before midnight
+section .text
 
 ; void ev_key_up(int keysym)
 ev_key_up:
@@ -1239,6 +1481,8 @@ ev_button_down:
     mov [mouse_click], eax
     jmp .out
 .b_game:
+    cmp dword [chat_open], 0
+    jne .out
     cmp dword [grabbed], 0
     jne .b_play
     call grab_mouse
@@ -1291,6 +1535,8 @@ ev_button_up:
 ; grabbed (and kept at the centre) the distance from the centre turns
 ; the view
 ev_motion:
+    cmp dword [chat_open], 0
+    jne .free
     cmp dword [grabbed], 0
     je .free
     mov eax, edi
@@ -1428,6 +1674,24 @@ poll_events:
 ; eax = mesh detail wanted at chunk offset (edi, esi): 1, 2 or 4
 ; (COARSE TERRAIN FROM = L: 2x beyond L chunks, 4x beyond 2L, 0 = off)
 want_scale:
+    ; the chunks next to the player's (and its own): full detail, and their
+    ; faces not merged (0x80) - a merged face's long edge meeting the ends
+    ; of smaller faces leaves hairline cracks that show up close
+    mov eax, edi
+    cdq
+    xor eax, edx
+    sub eax, edx
+    cmp eax, 1
+    ja .far
+    mov eax, esi
+    cdq
+    xor eax, edx
+    sub eax, edx
+    cmp eax, 1
+    ja .far
+    mov eax, 1 | 0x80
+    ret
+.far:
     mov eax, 1
     mov ecx, [set_lod]
     test ecx, ecx
@@ -1465,6 +1729,8 @@ update_chunks:
     call now
     movsd [rsp], xmm0
     xor ebx, ebx
+    cmp dword [gen_active], 0
+    jne .gstep                      ; a chunk begun last frame comes first
 .g:
     cmp ebx, [spiral_n]
     jae .mesh
@@ -1503,21 +1769,71 @@ update_chunks:
     jz .mesh                        ; queue full
     jmp .gnext
 .sync:
+    ; one core: the chunk is made a slice at a time, for a few milliseconds
+    ; a frame - more of them while chunks close to the player are missing
+    mov eax, [f_genfar]
+    mov ecx, [spiral_n]
+    shr ecx, 1
+    cmp ebx, ecx
+    jae .bud
+    mov eax, [f_genbudget]
+.bud:
+    mov [gen_budget], eax
     mov edx, [seed]
-    call world_gen_sync
+    call world_gen_begin
+    test eax, eax
+    jnz .gtime
+.gstep:
+    call world_gen_step
+    mov r15d, eax
     call now
     subsd xmm0, [rsp]
     cvtsd2ss xmm0, xmm0
-    comiss xmm0, [f_genbudget]
+    comiss xmm0, [gen_budget]
+    ja .mesh
+    test r15d, r15d
+    jz .gstep
+    xor ebx, ebx                    ; finished in time: the next one missing
+    jmp .g
+.gtime:
+    call now
+    subsd xmm0, [rsp]
+    cvtsd2ss xmm0, xmm0
+    comiss xmm0, [gen_budget]
     ja .mesh
 .gnext:
     inc ebx
     jmp .g
 
 .mesh:
-    ; relight chunks whose light went stale (edits), nearest first
+    ; relight chunks whose light went stale (edits), nearest first: the
+    ; step furthest behind (RELIGHT_STEPS) for every chunk before the next
     call now
     movsd [rsp], xmm0
+    xor r15d, r15d                  ; the highest step waiting
+    xor ebx, ebx
+.ls:
+    cmp ebx, [spiral_n]
+    jae .lsd
+    lea rax, [spiral]
+    mov edi, [cur_pcx]
+    add edi, [rax + rbx*8]
+    mov esi, [cur_pcz]
+    add esi, [rax + rbx*8 + 4]
+    call world_find
+    inc ebx
+    test eax, eax
+    js .ls
+    shl rax, CI_SHIFT
+    lea rcx, [chunk_info]
+    movzx eax, byte [rcx + rax + CI_LIGHTDIRTY]
+    cmp eax, r15d
+    cmovg r15d, eax
+    cmp r15d, RELIGHT_STEPS
+    jb .ls
+.lsd:
+    test r15d, r15d
+    jz .lit
     xor ebx, ebx
 .l:
     cmp ebx, [spiral_n]
@@ -1533,12 +1849,14 @@ update_chunks:
     mov r14d, eax
     shl rax, CI_SHIFT
     lea rcx, [chunk_info]
-    cmp byte [rcx + rax + CI_LIGHTDIRTY], 0
-    je .lnext
-    mov byte [rcx + rax + CI_LIGHTDIRTY], 0
+    cmp byte [rcx + rax + CI_LIGHTDIRTY], r15b
+    jne .lnext
+    dec byte [rcx + rax + CI_LIGHTDIRTY]
     mov byte [rcx + rax + CI_DIRTY], 1
     mov edi, r14d
-    mov esi, 1                      ; with light from the neighbours
+    xor esi, esi
+    cmp r15d, RELIGHT_STEPS         ; the first step: its own light only
+    setne sil                       ; then with light from the neighbours
     call light_chunk
     call now
     subsd xmm0, [rsp]

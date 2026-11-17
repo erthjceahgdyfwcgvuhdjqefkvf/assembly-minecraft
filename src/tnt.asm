@@ -1,17 +1,8 @@
-; tnt.asm - TNT and flint and steel.
-;
-; Right-clicking TNT with flint and steel lights it: the block turns into
-; a falling, flashing box that explodes after 4 seconds, like Minecraft's
-; (power 4). The explosion takes out a ragged ball of blocks about 4 nodes
-; across the middle (not bedrock, obsidian or liquids; nothing at all when
-; the TNT sits in water), drops a quarter of them as items, lights other
-; TNT in reach on a short fuse and hurts and throws players and mobs
-; within 8 nodes. Flint and steel lasts FLINT_USES lights.
-
 %include "common.inc"
 
 global tnt_clear, tnt_ignite, tnt_update, draw_tnt, flint_use, boom_t
 global tnts, tnt_explode
+extern sound_keep, sound_keep_at
 extern portal_try, fire_set, portal_break
 
 extern pos, vel, dt, game_mode, inv, sel_slot, target_hit, target
@@ -124,6 +115,10 @@ tnt_ignite:
     movss [rax + TN_Z], xmm1
     mov dword [rax + TN_VY], 0
     movss [rax + TN_FUSE], xmm0
+    movss xmm0, [rax + TN_X]
+    movss xmm1, [rax + TN_Y]
+    movss xmm2, [rax + TN_Z]
+    SFX_AT S_FUSE, 110, 100
     ret
 
 ; int flint_use(void) - right click with flint and steel: lights TNT
@@ -174,6 +169,7 @@ flint_use:
     mov edx, [target + 20]
     call fire_set
 .wear:
+    SFX S_IGNITE, 100, 100
     ; one use worn (survival)
     cmp dword [game_mode], 0
     jne .yes
@@ -260,6 +256,7 @@ tnt_explode:
     movss [rsp], xmm0
     movss [rsp + 4], xmm1
     movss [rsp + 8], xmm2
+    SFX_AT S_EXPLODE, 220, 100
     ; under water nothing breaks
     FLOORF edi, xmm0
     FLOORF esi, xmm1

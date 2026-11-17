@@ -1,10 +1,3 @@
-; font.asm - 5x7 bitmap font: texture builder and text drawing.
-;
-; The font texture is 128x64 RGBA: 16 x 6 cells of 8x8 for ASCII 32..127,
-; white where a glyph pixel is set, transparent elsewhere. Text is drawn
-; as one textured quad per character in the current colour; the caller
-; binds the font texture and keeps the texture matrix at identity.
-
 %include "common.inc"
 
 global font_build, font_rgba, text_draw, text_width
